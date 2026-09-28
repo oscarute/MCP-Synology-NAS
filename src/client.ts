@@ -452,7 +452,8 @@ function delay(ms: number): Promise<void> {
 /** Turns opaque fetch failures into something the operator can act on. */
 function normalizeNetworkError(error: unknown, baseUrl: string): Error {
   if (error instanceof Error) {
-    const cause = (error as { cause?: { code?: string } }).cause;
+    const cause = (error as { cause?: { code?: string; message?: string } })
+      .cause;
     const code = cause?.code;
 
     if (error.name === "AbortError") {
@@ -477,6 +478,20 @@ function normalizeNetworkError(error: unknown, baseUrl: string): Error {
       return new Error(
         "DSM uses a self-signed certificate. Set SYNOLOGY_INSECURE_TLS=true if this is a trusted LAN or tunnel.",
       );
+    }
+    if (
+      code === "ERR_TLS_CERT_ALTNAME_INVALID" ||
+      code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+    ) {
+      return new Error(
+        `The DSM certificate does not match ${baseUrl} (${code}). Use the hostname the certificate was issued for, or set SYNOLOGY_INSECURE_TLS=true for a LAN address.`,
+      );
+    }
+    // undici reports every network failure as a bare "fetch failed" and keeps
+    // the real reason in `cause`; without it the error is undiagnosable.
+    const detail = code ?? cause?.message;
+    if (detail) {
+      return new Error(`Cannot reach DSM at ${baseUrl}: ${detail}`);
     }
     return error;
   }

@@ -171,8 +171,19 @@ Container Manager), no command line.
    the existing `compose.yaml`. Container Manager builds the image and starts
    the container.
 
-To update, download the ZIP again, replace the `MCP-Synology-NAS-main`
-folder with the new one, and rebuild the project from Container Manager.
+### Updating
+
+1. Download the ZIP again and replace the `MCP-Synology-NAS-main` folder with
+   the new one. Your `compose.yaml` in `mcp-synology/` stays untouched.
+2. In **Container Manager → Project**, stop the `mcp-synology` project.
+3. Under **Container**, delete `synology-mcp`; then under **Image**, delete
+   `mcp-server-synology:latest`. Because `compose.yaml` names the image,
+   Container Manager reuses an existing one instead of rebuilding it, so
+   without this step the old code keeps running.
+4. Back in **Project**, build `mcp-synology`. The build log should show
+   `npm install` and `npm run build`.
+
+Connected Claude conversations reconnect on their own after the restart.
 
 ## Configuration
 
