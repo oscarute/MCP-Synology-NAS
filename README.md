@@ -1,4 +1,4 @@
-# mcp-server-synology
+# MCP-Synology-NAS
 
 An MCP server that exposes a Synology NAS through the official DSM WebAPI.
 
