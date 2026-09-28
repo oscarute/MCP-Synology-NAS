@@ -60,6 +60,14 @@ function buildSearchParams(params: Record<string, unknown>): URLSearchParams {
   return search;
 }
 
+/**
+ * DSM session name sent on login/logout. "webui" is the generic desktop
+ * session: an app-specific name such as "FileStation" makes DSM reject the
+ * login (402) when the account lacks that app's privilege, even if the tools
+ * being used never touch it. Per-API permissions are still enforced (105).
+ */
+const DSM_SESSION = "webui";
+
 export class DsmClient {
   private sid: string | null = null;
   private sessionCreatedAt = 0;
@@ -156,7 +164,7 @@ export class DsmClient {
       method: "login",
       account: this.credentials.user,
       passwd: this.credentials.password,
-      session: "FileStation",
+      session: DSM_SESSION,
       format: "sid",
     };
     if (this.credentials.otp) params.otp_code = this.credentials.otp;
@@ -192,7 +200,7 @@ export class DsmClient {
         api: "SYNO.API.Auth",
         version,
         method: "logout",
-        session: "FileStation",
+        session: DSM_SESSION,
         _sid: this.sid,
       }).toString();
       await this.fetchJson(url, { method: "GET" });
