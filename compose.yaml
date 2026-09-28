@@ -1,5 +1,6 @@
 # Self-contained deployment: every setting lives in this file, no .env needed.
-# Fill in the values marked REQUIRED, then run: docker compose up -d --build
+# Fill in the values marked REQUIRED, then create a Container Manager project
+# from it (or run: docker compose up -d --build).
 #
 # Once filled in, this file holds credentials: keep it private (chmod 600) and
 # never publish or commit your filled-in copy.
@@ -10,9 +11,11 @@
 services:
   synology-mcp:
     build:
-      # Folder holding the Dockerfile. Change it if this file sits outside the
-      # source folder, e.g. ./mcp-server-synology-main
-      context: .
+      # Folder holding the Dockerfile. The default matches the layout in the
+      # README: docker/mcp-synology/compose.yaml next to the extracted
+      # mcp-server-synology-main/ folder. Use "." if this file sits next to
+      # the Dockerfile (e.g. in a git clone).
+      context: ./mcp-server-synology-main
     image: mcp-server-synology:latest
     container_name: synology-mcp
     restart: unless-stopped

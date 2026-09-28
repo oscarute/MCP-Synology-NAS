@@ -140,6 +140,40 @@ must send `Authorization: Bearer <token>`.
 3. **Operations.** Enable delete, system control or the generic bridge only
    once you trust the setup.
 
+## Installation
+
+The steps below use only the DSM web interface (File Station and
+Container Manager), no command line.
+
+1. On this repository's GitHub page, click **Code → Download ZIP**.
+2. In File Station, create a folder named `mcp-synology` inside the `docker`
+   shared folder, upload the ZIP into it and extract it there
+   (right-click → **Extract → Extract here**).
+3. Copy `mcp-server-synology-main/compose.yaml` one level up, into
+   `mcp-synology/`. The result should look like this:
+
+   ```
+   docker/
+   └── mcp-synology/
+       ├── compose.yaml                  ← your copy, edited in step 4
+       └── mcp-server-synology-main/
+           ├── Dockerfile
+           ├── compose.yaml
+           └── src/
+   ```
+
+   Keeping your copy outside the source folder means an update never
+   overwrites your settings.
+4. Edit `mcp-synology/compose.yaml` (for example with the Text Editor
+   package) as described in [Configuration](#configuration).
+5. In **Container Manager → Project → Create**, name the project
+   `mcp-synology`, set the path to `/docker/mcp-synology` and choose to use
+   the existing `compose.yaml`. Container Manager builds the image and starts
+   the container.
+
+To update, download the ZIP again, replace the `mcp-server-synology-main`
+folder with the new one, and rebuild the project from Container Manager.
+
 ## Configuration
 
 Everything is configured in a single file, `compose.yaml`: no `.env` or other
@@ -152,28 +186,20 @@ everything else has a safe default. Each setting is documented inline.
   verification for the whole process.
 - A literal `$` in any value must be written as `$$`, or Compose treats it as
   a variable reference.
-- Once filled in, `compose.yaml` holds credentials: keep it private
-  (`chmod 600 compose.yaml`) and never publish your filled-in copy.
+- Set `SYNOLOGY_MCP_TOKEN` to a long random value: it is the only credential
+  the Claude connector sends.
+- Once filled in, `compose.yaml` holds credentials: keep it private and never
+  publish your filled-in copy.
+- `build.context` defaults to `./mcp-server-synology-main`, matching the
+  layout above. If `compose.yaml` sits next to the `Dockerfile` (for example
+  in a `git clone`), set it to `.`.
 
-## Running
-
-### Docker Compose
-
-```bash
-$EDITOR compose.yaml
-docker compose up -d --build
-docker compose logs -f
-```
-
-`build.context` points at the folder holding the `Dockerfile`. If you keep
-`compose.yaml` outside the source folder (for example next to an extracted
-`mcp-server-synology-main/`), set `context: ./mcp-server-synology-main`.
-On Synology, the same file works as a Container Manager project.
-
-The container binds to `127.0.0.1:3020` so only a local reverse proxy can
-reach it. Change the `ports` entry to expose it elsewhere.
+The container binds to `127.0.0.1:3020`, so only a reverse proxy running on
+the NAS can reach it.
 
 ### Local stdio
+
+For a desktop MCP client running on the same machine:
 
 ```bash
 npm install
@@ -183,22 +209,69 @@ SYNOLOGY_MCP_TRANSPORT=stdio node dist/index.js
 
 ## Reaching a NAS that sits behind your home router
 
-A hosted MCP server cannot dial into a home LAN directly. Rather than
-port-forwarding DSM to the public internet, put both machines on a private
-overlay network and point `SYNOLOGY_URL` at the overlay address:
+Claude connects to the MCP server from Anthropic's infrastructure over HTTPS,
+so the server has to be reachable from the internet. The simplest way when it
+runs on the NAS is DSM's built-in reverse proxy.
+
+### DSM reverse proxy
+
+**Requirements**
+
+- Your router has a public IP address and is **not** behind CG-NAT.
+- The router forwards TCP port 443 (HTTPS) to port 443 of the NAS's local IP
+  address.
+- A DSM hostname, such as a Synology DDNS name (`mynas.synology.me`), with a
+  certificate that covers the subdomain you will use.
+
+All the settings below live in **Control Panel → Login Portal → Advanced**.
+
+**1. Access Control Profile.** Create a profile named `Claude` with these
+rules, in this order:
+
+| Action | Source | Purpose |
+| --- | --- | --- |
+| Allow | `160.79.104.0/21` | Anthropic's outbound range, used by Claude connectors |
+| Allow | `192.168.1.0/24` | Your local network; adjust it to your own subnet |
+| Deny | All | Everything else |
+
+Anthropic may change its IP ranges; check its documentation if the
+connector stops reaching the server.
+
+**2. Reverse Proxy.** Create a rule named `MCP`:
+
+| | Protocol | Hostname | Port |
+| --- | --- | --- | --- |
+| Source | HTTPS | A subdomain of your choice, e.g. `mcp.mynas.synology.me` | 443 |
+| Destination | HTTP | `localhost` | 3020 |
+
+In the source section, set **Access control profile** to `Claude`, then save.
+The destination port matches the `ports` entry in `compose.yaml`.
+
+### Alternatives
+
+If you would rather not open port 443, or the MCP server runs on another host
+that needs to reach DSM, use a private overlay network or a tunnel instead:
 
 - **Tailscale** — install on the NAS and the host running this server, then use
   the NAS's tailnet address. Simplest option, no router changes.
 - **WireGuard** — a manual tunnel if you already run one.
 - **frp / Cloudflare Tunnel** — a reverse tunnel initiated from the NAS.
 
-Only the MCP server needs to reach DSM. DSM itself stays unexposed.
+## Claude connector configuration
+
+1. In Claude, open the connector settings and choose **Add custom connector**.
+2. Give the connector a name of your choice.
+3. Enter the URL of your MCP server as configured in the reverse proxy, for
+   example `https://mcp.mynas.synology.me/`.
+4. Choose the option without login (no OAuth).
+5. Add the header `Authorization: Bearer <token>`, where `<token>` is the
+   value of `SYNOLOGY_MCP_TOKEN` in your `compose.yaml`.
 
 ## Endpoints
 
 | Path | Purpose |
 | --- | --- |
-| `POST /mcp` | MCP Streamable HTTP endpoint |
+| `POST /` or `POST /mcp` | MCP Streamable HTTP endpoint |
 | `GET /healthz` | Liveness, active sessions, exposed tool count, active policy |
 
 `/healthz` reports the policy in force, so the running security posture is
