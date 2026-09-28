@@ -32,8 +32,10 @@ services:
       # 6-digit code for accounts with 2-step verification. A static value only
       # works while it is valid, so prefer an account without 2FA.
       SYNOLOGY_OTP: ""
-      # true only for a DSM using a self-signed certificate on the LAN.
-      SYNOLOGY_INSECURE_TLS: "false"
+      # "true" when SYNOLOGY_URL is a LAN IP: DSM's certificate (self-signed or
+      # issued for a hostname such as mynas.synology.me) never matches an IP.
+      # Set "false" only if SYNOLOGY_URL uses the hostname on the certificate.
+      SYNOLOGY_INSECURE_TLS: "true"
       # Proactive session refresh; expired sessions are renewed automatically.
       SYNOLOGY_SESSION_TTL_SECONDS: "1800"
 

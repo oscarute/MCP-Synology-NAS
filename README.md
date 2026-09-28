@@ -192,9 +192,11 @@ files are needed. Edit the values in its `environment` block;
 `SYNOLOGY_URL`, `SYNOLOGY_USER` and `SYNOLOGY_PASSWORD` are required and
 everything else has a safe default. Each setting is documented inline.
 
-- If DSM uses a self-signed certificate, set `SYNOLOGY_INSECURE_TLS: "true"`.
-  This is scoped to this client's connection pool rather than disabling TLS
-  verification for the whole process.
+- `SYNOLOGY_INSECURE_TLS` defaults to `"true"` because `SYNOLOGY_URL` is
+  normally a LAN IP, and DSM's certificate never matches an IP. It is scoped
+  to this client's connection pool rather than disabling TLS verification for
+  the whole process. Set it to `"false"` only when `SYNOLOGY_URL` uses the
+  hostname the certificate was issued for.
 - A literal `$` in any value must be written as `$$`, or Compose treats it as
   a variable reference.
 - Set `SYNOLOGY_MCP_TOKEN` to a long random value: it is the only credential
