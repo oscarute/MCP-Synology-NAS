@@ -13,9 +13,9 @@ services:
     build:
       # Folder holding the Dockerfile. The default matches the layout in the
       # README: docker/mcp-synology/compose.yaml next to the extracted
-      # mcp-server-synology-main/ folder. Use "." if this file sits next to
+      # MCP-Synology-NAS-main/ folder. Use "." if this file sits next to
       # the Dockerfile (e.g. in a git clone).
-      context: ./mcp-server-synology-main
+      context: ./MCP-Synology-NAS-main
     image: mcp-server-synology:latest
     container_name: synology-mcp
     restart: unless-stopped

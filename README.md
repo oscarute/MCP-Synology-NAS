@@ -149,14 +149,14 @@ Container Manager), no command line.
 2. In File Station, create a folder named `mcp-synology` inside the `docker`
    shared folder, upload the ZIP into it and extract it there
    (right-click → **Extract → Extract here**).
-3. Copy `mcp-server-synology-main/compose.yaml` one level up, into
+3. Copy `MCP-Synology-NAS-main/compose.yaml` one level up, into
    `mcp-synology/`. The result should look like this:
 
    ```
    docker/
    └── mcp-synology/
        ├── compose.yaml                  ← your copy, edited in step 4
-       └── mcp-server-synology-main/
+       └── MCP-Synology-NAS-main/
            ├── Dockerfile
            ├── compose.yaml
            └── src/
@@ -171,7 +171,7 @@ Container Manager), no command line.
    the existing `compose.yaml`. Container Manager builds the image and starts
    the container.
 
-To update, download the ZIP again, replace the `mcp-server-synology-main`
+To update, download the ZIP again, replace the `MCP-Synology-NAS-main`
 folder with the new one, and rebuild the project from Container Manager.
 
 ## Configuration
@@ -190,9 +190,11 @@ everything else has a safe default. Each setting is documented inline.
   the Claude connector sends.
 - Once filled in, `compose.yaml` holds credentials: keep it private and never
   publish your filled-in copy.
-- `build.context` defaults to `./mcp-server-synology-main`, matching the
+- `build.context` defaults to `./MCP-Synology-NAS-main`, matching the
   layout above. If `compose.yaml` sits next to the `Dockerfile` (for example
-  in a `git clone`), set it to `.`.
+  in a `git clone`), set it to `.`. GitHub names the extracted folder
+  `<repository>-<branch>`, so a fork or another branch produces a different
+  name: adjust `context` to match it exactly (it is case-sensitive).
 
 The container binds to `127.0.0.1:3020`, so only a reverse proxy running on
 the NAS can reach it.
