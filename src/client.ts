@@ -156,7 +156,7 @@ export class DsmClient {
       method: "login",
       account: this.credentials.user,
       passwd: this.credentials.password,
-      session: "NotionMCP",
+      session: "FileStation",
       format: "sid",
     };
     if (this.credentials.otp) params.otp_code = this.credentials.otp;
@@ -192,7 +192,7 @@ export class DsmClient {
         api: "SYNO.API.Auth",
         version,
         method: "logout",
-        session: "NotionMCP",
+        session: "FileStation",
         _sid: this.sid,
       }).toString();
       await this.fetchJson(url, { method: "GET" });
