@@ -142,27 +142,36 @@ must send `Authorization: Bearer <token>`.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill it in. `SYNOLOGY_URL`, `SYNOLOGY_USER`
-and `SYNOLOGY_PASSWORD` are required; everything else has a safe default.
+Everything is configured in a single file, `compose.yaml`: no `.env` or other
+files are needed. Edit the values in its `environment` block;
+`SYNOLOGY_URL`, `SYNOLOGY_USER` and `SYNOLOGY_PASSWORD` are required and
+everything else has a safe default. Each setting is documented inline.
 
-If DSM uses a self-signed certificate, set `SYNOLOGY_INSECURE_TLS=true`. This
-is scoped to this client's connection pool rather than disabling TLS
-verification for the whole process.
+- If DSM uses a self-signed certificate, set `SYNOLOGY_INSECURE_TLS: "true"`.
+  This is scoped to this client's connection pool rather than disabling TLS
+  verification for the whole process.
+- A literal `$` in any value must be written as `$$`, or Compose treats it as
+  a variable reference.
+- Once filled in, `compose.yaml` holds credentials: keep it private
+  (`chmod 600 compose.yaml`) and never publish your filled-in copy.
 
 ## Running
 
 ### Docker Compose
 
 ```bash
-cp .env.example .env
-$EDITOR .env
+$EDITOR compose.yaml
 docker compose up -d --build
 docker compose logs -f
 ```
 
-The container binds to `127.0.0.1:3020` by default so only a local reverse
-proxy can reach it. Override with `SYNOLOGY_HOST_BIND` and
-`SYNOLOGY_HOST_PORT`.
+`build.context` points at the folder holding the `Dockerfile`. If you keep
+`compose.yaml` outside the source folder (for example next to an extracted
+`mcp-server-synology-main/`), set `context: ./mcp-server-synology-main`.
+On Synology, the same file works as a Container Manager project.
+
+The container binds to `127.0.0.1:3020` so only a local reverse proxy can
+reach it. Change the `ports` entry to expose it elsewhere.
 
 ### Local stdio
 
