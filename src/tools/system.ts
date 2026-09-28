@@ -14,7 +14,8 @@ export const systemTools = [
       const info = await ctx.client.request<Record<string, any>>(
         "SYNO.Core.System",
         "info",
-        { type: '""' },
+        {},
+        { version: 1 },
       );
 
       const uptimeSeconds = Number(info.up_time ?? 0);
