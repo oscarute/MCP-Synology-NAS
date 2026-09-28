@@ -1,4 +1,4 @@
-# mcp-server-synology
+# MCP-Synology-NAS
 
 An MCP server that exposes a Synology NAS through the official DSM WebAPI.
 
@@ -140,31 +140,81 @@ must send `Authorization: Bearer <token>`.
 3. **Operations.** Enable delete, system control or the generic bridge only
    once you trust the setup.
 
+## Installation
+
+The steps below use only the DSM web interface (File Station and
+Container Manager), no command line.
+
+1. On this repository's GitHub page, click **Code → Download ZIP**.
+2. In File Station, create a folder named `mcp-synology` inside the `docker`
+   shared folder, upload the ZIP into it and extract it there
+   (right-click → **Extract → Extract here**).
+3. Copy `MCP-Synology-NAS-main/compose.yaml` one level up, into
+   `mcp-synology/`. The result should look like this:
+
+   ```
+   docker/
+   └── mcp-synology/
+       ├── compose.yaml                  ← your copy, edited in step 4
+       └── MCP-Synology-NAS-main/
+           ├── Dockerfile
+           ├── compose.yaml
+           └── src/
+   ```
+
+   Keeping your copy outside the source folder means an update never
+   overwrites your settings.
+4. Edit `mcp-synology/compose.yaml` (for example with the Text Editor
+   package) as described in [Configuration](#configuration).
+5. In **Container Manager → Project → Create**, name the project
+   `mcp-synology`, set the path to `/docker/mcp-synology` and choose to use
+   the existing `compose.yaml`. Container Manager builds the image and starts
+   the container.
+
+### Updating
+
+1. Download the ZIP again and replace the `MCP-Synology-NAS-main` folder with
+   the new one. Your `compose.yaml` in `mcp-synology/` stays untouched.
+2. In **Container Manager → Project**, stop the `mcp-synology` project.
+3. Under **Container**, delete `synology-mcp`; then under **Image**, delete
+   `mcp-server-synology:latest`. Because `compose.yaml` names the image,
+   Container Manager reuses an existing one instead of rebuilding it, so
+   without this step the old code keeps running.
+4. Back in **Project**, build `mcp-synology`. The build log should show
+   `npm install` and `npm run build`.
+
+Connected Claude conversations reconnect on their own after the restart.
+
 ## Configuration
 
-Copy `.env.example` to `.env` and fill it in. `SYNOLOGY_URL`, `SYNOLOGY_USER`
-and `SYNOLOGY_PASSWORD` are required; everything else has a safe default.
+Everything is configured in a single file, `compose.yaml`: no `.env` or other
+files are needed. Edit the values in its `environment` block;
+`SYNOLOGY_URL`, `SYNOLOGY_USER` and `SYNOLOGY_PASSWORD` are required and
+everything else has a safe default. Each setting is documented inline.
 
-If DSM uses a self-signed certificate, set `SYNOLOGY_INSECURE_TLS=true`. This
-is scoped to this client's connection pool rather than disabling TLS
-verification for the whole process.
+- `SYNOLOGY_INSECURE_TLS` defaults to `"true"` because `SYNOLOGY_URL` is
+  normally a LAN IP, and DSM's certificate never matches an IP. It is scoped
+  to this client's connection pool rather than disabling TLS verification for
+  the whole process. Set it to `"false"` only when `SYNOLOGY_URL` uses the
+  hostname the certificate was issued for.
+- A literal `$` in any value must be written as `$$`, or Compose treats it as
+  a variable reference.
+- Set `SYNOLOGY_MCP_TOKEN` to a long random value: it is the only credential
+  the Claude connector sends.
+- Once filled in, `compose.yaml` holds credentials: keep it private and never
+  publish your filled-in copy.
+- `build.context` defaults to `./MCP-Synology-NAS-main`, matching the
+  layout above. If `compose.yaml` sits next to the `Dockerfile` (for example
+  in a `git clone`), set it to `.`. GitHub names the extracted folder
+  `<repository>-<branch>`, so a fork or another branch produces a different
+  name: adjust `context` to match it exactly (it is case-sensitive).
 
-## Running
-
-### Docker Compose
-
-```bash
-cp .env.example .env
-$EDITOR .env
-docker compose up -d --build
-docker compose logs -f
-```
-
-The container binds to `127.0.0.1:3020` by default so only a local reverse
-proxy can reach it. Override with `SYNOLOGY_HOST_BIND` and
-`SYNOLOGY_HOST_PORT`.
+The container binds to `127.0.0.1:3020`, so only a reverse proxy running on
+the NAS can reach it.
 
 ### Local stdio
+
+For a desktop MCP client running on the same machine:
 
 ```bash
 npm install
@@ -174,22 +224,69 @@ SYNOLOGY_MCP_TRANSPORT=stdio node dist/index.js
 
 ## Reaching a NAS that sits behind your home router
 
-A hosted MCP server cannot dial into a home LAN directly. Rather than
-port-forwarding DSM to the public internet, put both machines on a private
-overlay network and point `SYNOLOGY_URL` at the overlay address:
+Claude connects to the MCP server from Anthropic's infrastructure over HTTPS,
+so the server has to be reachable from the internet. The simplest way when it
+runs on the NAS is DSM's built-in reverse proxy.
+
+### DSM reverse proxy
+
+**Requirements**
+
+- Your router has a public IP address and is **not** behind CG-NAT.
+- The router forwards TCP port 443 (HTTPS) to port 443 of the NAS's local IP
+  address.
+- A DSM hostname, such as a Synology DDNS name (`mynas.synology.me`), with a
+  certificate that covers the subdomain you will use.
+
+All the settings below live in **Control Panel → Login Portal → Advanced**.
+
+**1. Access Control Profile.** Create a profile named `Claude` with these
+rules, in this order:
+
+| Action | Source | Purpose |
+| --- | --- | --- |
+| Allow | `160.79.104.0/21` | Anthropic's outbound range, used by Claude connectors |
+| Allow | `192.168.1.0/24` | Your local network; adjust it to your own subnet |
+| Deny | All | Everything else |
+
+Anthropic may change its IP ranges; check its documentation if the
+connector stops reaching the server.
+
+**2. Reverse Proxy.** Create a rule named `MCP`:
+
+| | Protocol | Hostname | Port |
+| --- | --- | --- | --- |
+| Source | HTTPS | A subdomain of your choice, e.g. `mcp.mynas.synology.me` | 443 |
+| Destination | HTTP | `localhost` | 3020 |
+
+In the source section, set **Access control profile** to `Claude`, then save.
+The destination port matches the `ports` entry in `compose.yaml`.
+
+### Alternatives
+
+If you would rather not open port 443, or the MCP server runs on another host
+that needs to reach DSM, use a private overlay network or a tunnel instead:
 
 - **Tailscale** — install on the NAS and the host running this server, then use
   the NAS's tailnet address. Simplest option, no router changes.
 - **WireGuard** — a manual tunnel if you already run one.
 - **frp / Cloudflare Tunnel** — a reverse tunnel initiated from the NAS.
 
-Only the MCP server needs to reach DSM. DSM itself stays unexposed.
+## Claude connector configuration
+
+1. In Claude, open the connector settings and choose **Add custom connector**.
+2. Give the connector a name of your choice.
+3. Enter the URL of your MCP server as configured in the reverse proxy, for
+   example `https://mcp.mynas.synology.me/`.
+4. Choose the option without login (no OAuth).
+5. Add the header `Authorization: Bearer <token>`, where `<token>` is the
+   value of `SYNOLOGY_MCP_TOKEN` in your `compose.yaml`.
 
 ## Endpoints
 
 | Path | Purpose |
 | --- | --- |
-| `POST /mcp` | MCP Streamable HTTP endpoint |
+| `POST /` or `POST /mcp` | MCP Streamable HTTP endpoint |
 | `GET /healthz` | Liveness, active sessions, exposed tool count, active policy |
 
 `/healthz` reports the policy in force, so the running security posture is

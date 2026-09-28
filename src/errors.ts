@@ -34,7 +34,7 @@ const COMMON: Record<number, string> = {
 const AUTH: Record<number, string> = {
   400: "No such account, or incorrect password.",
   401: "Disabled account.",
-  402: "Permission denied.",
+  402: "Permission denied. The account may lack the DSM application privilege required to sign in.",
   403: "2-step verification code required. Set SYNOLOGY_OTP, or use an account without 2FA.",
   404: "Failed to authenticate the 2-step verification code.",
   406: "Enforced 2-step verification. Enable it for this account or use another account.",

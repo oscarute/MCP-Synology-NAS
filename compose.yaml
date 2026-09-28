@@ -1,0 +1,95 @@
+# Self-contained deployment: every setting lives in this file, no .env needed.
+# Fill in the values marked REQUIRED, then create a Container Manager project
+# from it (or run: docker compose up -d --build).
+#
+# Once filled in, this file holds credentials: keep it private (chmod 600) and
+# never publish or commit your filled-in copy.
+#
+# A literal "$" inside any value must be written as "$$", otherwise Compose
+# treats it as a variable reference (e.g. password "a$b" -> "a$$b").
+
+services:
+  synology-mcp:
+    build:
+      # Folder holding the Dockerfile. The default matches the layout in the
+      # README: docker/mcp-synology/compose.yaml next to the extracted
+      # MCP-Synology-NAS-main/ folder. Use "." if this file sits next to
+      # the Dockerfile (e.g. in a git clone).
+      context: ./MCP-Synology-NAS-main
+    image: mcp-server-synology:latest
+    container_name: synology-mcp
+    restart: unless-stopped
+    environment:
+      # --- DSM connection -----------------------------------------------------
+      # REQUIRED. Full base URL of DSM, including scheme and port.
+      # QuickConnect and DDNS hostnames also work.
+      SYNOLOGY_URL: "https://192.168.1.10:5001"
+      # REQUIRED. Dedicated DSM account. Do NOT use an administrator account:
+      # create a limited user and grant it only the shared folders it needs.
+      SYNOLOGY_USER: "mcp-bot"
+      # REQUIRED.
+      SYNOLOGY_PASSWORD: ""
+      # 6-digit code for accounts with 2-step verification. A static value only
+      # works while it is valid, so prefer an account without 2FA.
+      SYNOLOGY_OTP: ""
+      # "true" when SYNOLOGY_URL is a LAN IP: DSM's certificate (self-signed or
+      # issued for a hostname such as mynas.synology.me) never matches an IP.
+      # Set "false" only if SYNOLOGY_URL uses the hostname on the certificate.
+      SYNOLOGY_INSECURE_TLS: "true"
+      # Proactive session refresh; expired sessions are renewed automatically.
+      SYNOLOGY_SESSION_TTL_SECONDS: "1800"
+
+      # --- Safety policy ------------------------------------------------------
+      # Master switch: when true, every mutating tool is refused.
+      # Recommended for the first deployment.
+      SYNOLOGY_READONLY: "true"
+      # Permanently deleting files, gated separately from ordinary writes.
+      SYNOLOGY_ALLOW_DELETE: "false"
+      # Restart/shutdown DSM, control containers, change service state.
+      SYNOLOGY_ALLOW_SYSTEM_CONTROL: "false"
+      # Raw DSM WebAPI escape hatch (dsm_api_call).
+      SYNOLOGY_ALLOW_GENERIC_API: "false"
+      # Comma-separated File Station paths, shared-folder rooted (not /volume1).
+      # Empty allows every path the DSM account can reach.
+      # Example: /Documents,/AI-Inbox,/Downloads
+      SYNOLOGY_ALLOWED_PATHS: ""
+      # Comma-separated denylist, applied even inside allowed paths.
+      SYNOLOGY_DENIED_PATHS: ""
+      # Largest file read_file will pull into the conversation.
+      SYNOLOGY_MAX_READ_BYTES: "1048576"
+
+      # --- Transport ----------------------------------------------------------
+      SYNOLOGY_MCP_TRANSPORT: "http"
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      # Clients must send "Authorization: Bearer <token>".
+      # Generate one with: openssl rand -hex 32
+      SYNOLOGY_MCP_TOKEN: ""
+
+      # --- Reliability --------------------------------------------------------
+      SYNOLOGY_REQUEST_TIMEOUT_MS: "30000"
+      SYNOLOGY_MAX_RETRIES: "2"
+      LOG_LEVEL: "info"
+    ports:
+      # Bound to loopback so only a local reverse proxy can reach it.
+      # Use "3020:3000" to expose it on every interface.
+      - "127.0.0.1:3020:3000"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http'+'://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

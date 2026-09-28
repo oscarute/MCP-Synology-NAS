@@ -132,6 +132,21 @@ export async function startHttpServer(
       return;
     }
 
+    // Sessions live in memory, so a restart forgets them. The MCP spec
+    // requires 404 for an unknown session id: that is what tells the client
+    // to re-initialize instead of failing every call with 400.
+    if (typeof sessionId === "string") {
+      sendJson(res, 404, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32001,
+          message: "Session not found. Start a new MCP session.",
+        },
+        id: null,
+      });
+      return;
+    }
+
     if (req.method !== "POST") {
       sendJson(res, 400, {
         error:
