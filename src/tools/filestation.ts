@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
+import type { DsmClient } from "../client.js";
+import { SynologyError } from "../errors.js";
 import { defineTool, humanBytes, isoTime, pathParam } from "../tool.js";
 
 /** Shape of a File Station file/folder entry, trimmed to the useful fields. */
@@ -40,6 +43,124 @@ function summarizeEntry(entry: FileEntry) {
     owner: extra.owner?.user,
     group: extra.owner?.group,
   };
+}
+
+/**
+ * Some DSM builds evict a File Station background task as soon as it
+ * completes, so the status poll reports 599 "no such task" for work that
+ * actually finished. Maps that case to null; any other failure still rejects.
+ */
+function statusOrEvicted<T>(request: Promise<T>): Promise<T | null> {
+  return request.catch((error) =>
+    error instanceof SynologyError && error.code === 599
+      ? null
+      : Promise.reject(error),
+  );
+}
+
+/** Slowest read speed the download fallback budgets for. */
+const MIN_HASH_BYTES_PER_SECOND = 20 * 1024 * 1024;
+
+/**
+ * Hashes the file while it streams from DSM, the fallback once the MD5 task
+ * is evicted. Memory stays flat whatever the file size, and the time budget
+ * grows with the size so a large file is not cut off by a small timeout.
+ */
+async function md5ByDownload(
+  client: DsmClient,
+  path: string,
+  minSeconds: number,
+): Promise<{ md5: string; bytes: number }> {
+  const { body, contentLength } = await client.requestStream(
+    "SYNO.FileStation.Download",
+    "download",
+    { path: pathParam([path]), mode: "download" },
+  );
+
+  const budgetMs =
+    Math.max(minSeconds, Math.ceil((contentLength ?? 0) / MIN_HASH_BYTES_PER_SECOND)) *
+    1000;
+  const hash = createHash("md5");
+  const reader = body.getReader();
+  let bytes = 0;
+  let timedOut = false;
+  // Cancelling the reader also resolves a read() that is stuck waiting.
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void reader.cancel().catch(() => undefined);
+  }, budgetMs);
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      hash.update(value);
+      bytes += value.length;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (timedOut) {
+    throw new Error(
+      `Hashing ${path} by download did not finish within ${Math.round(budgetMs / 1000)}s ` +
+        `(${humanBytes(bytes)} of ${contentLength ? humanBytes(contentLength) : "unknown size"} read). ` +
+        "Raise timeoutSeconds, or check the connection to DSM.",
+    );
+  }
+  if (contentLength !== undefined && bytes !== contentLength) {
+    throw new Error(
+      `Download of ${path} ended after ${bytes} of ${contentLength} bytes, so no checksum was produced.`,
+    );
+  }
+  return { md5: hash.digest("hex"), bytes };
+}
+
+/**
+ * Sums a folder tree through the listing API: slower than the DirSize task,
+ * but unaffected by task eviction. Stops descending once the deadline passes
+ * and reports the result as incomplete.
+ */
+async function folderSizeByListing(
+  client: DsmClient,
+  root: string,
+  deadline: number,
+): Promise<{ folders: number; files: number; totalSize: number; complete: boolean }> {
+  const totals = { folders: 0, files: 0, totalSize: 0, complete: true };
+
+  const walk = async (dir: string): Promise<void> => {
+    for (let offset = 0; ; ) {
+      if (Date.now() >= deadline) {
+        totals.complete = false;
+        return;
+      }
+      const page = await client.request<{ files?: FileEntry[]; total: number }>(
+        "SYNO.FileStation.List",
+        "list",
+        {
+          folder_path: dir,
+          offset,
+          limit: 1000,
+          additional: pathParam(["size"]),
+        },
+      );
+      const entries = page.files ?? [];
+      for (const entry of entries) {
+        if (entry.isdir) {
+          totals.folders += 1;
+          await walk(entry.path);
+        } else {
+          totals.files += 1;
+          totals.totalSize += entry.additional?.size ?? 0;
+        }
+      }
+      offset += entries.length;
+      if (entries.length === 0 || offset >= (page.total ?? 0)) return;
+    }
+  };
+
+  await walk(root);
+  return totals;
 }
 
 export const fileStationReadTools = [
@@ -334,12 +455,42 @@ export const fileStationReadTools = [
       const deadline = Date.now() + args.timeoutSeconds * 1000;
       try {
         while (Date.now() < deadline) {
-          const status = await ctx.client.request<{
-            finished: boolean;
-            num_dir: number;
-            num_file: number;
-            total_size: number;
-          }>("SYNO.FileStation.DirSize", "status", { taskid: started.taskid });
+          const status = await statusOrEvicted(
+            ctx.client.request<{
+              finished: boolean;
+              num_dir: number;
+              num_file: number;
+              total_size: number;
+            }>("SYNO.FileStation.DirSize", "status", { taskid: started.taskid }),
+          );
+
+          if (!status) {
+            let folders = 0;
+            let files = 0;
+            let totalBytes = 0;
+            let complete = true;
+            for (const dir of paths) {
+              const sub = await folderSizeByListing(ctx.client, dir, deadline);
+              folders += sub.folders;
+              files += sub.files;
+              totalBytes += sub.totalSize;
+              complete &&= sub.complete;
+            }
+            return {
+              paths,
+              folders,
+              files,
+              totalBytes,
+              totalSize: humanBytes(totalBytes),
+              method: "listing",
+              ...(complete
+                ? {}
+                : {
+                    complete: false,
+                    note: "DSM evicted the size task and the listing walk hit the timeout, so these totals are partial. Raise timeoutSeconds for very large folders.",
+                  }),
+            };
+          }
 
           if (status.finished) {
             return {
@@ -348,6 +499,7 @@ export const fileStationReadTools = [
               files: status.num_file,
               totalBytes: status.total_size,
               totalSize: humanBytes(status.total_size),
+              method: "dsm",
             };
           }
           await new Promise((resolve) => setTimeout(resolve, 800));
@@ -371,7 +523,7 @@ export const fileStationReadTools = [
     name: "get_file_checksum",
     title: "Compute a file checksum",
     description:
-      "Computes the MD5 checksum of a file on the NAS, for verifying an upload or comparing two copies without downloading them.",
+      "Computes the MD5 checksum of a file on the NAS, for verifying an upload or comparing two copies. Runs a DSM background task; if DSM evicts the task before it can be polled, streams the file and hashes it locally instead. The result's method field says which path was used.",
     readOnly: true,
     idempotent: true,
     schema: z.object({
@@ -388,11 +540,17 @@ export const fileStationReadTools = [
 
       const deadline = Date.now() + args.timeoutSeconds * 1000;
       while (Date.now() < deadline) {
-        const status = await ctx.client.request<{
-          finished: boolean;
-          md5?: string;
-        }>("SYNO.FileStation.MD5", "status", { taskid: started.taskid });
-        if (status.finished) return { path, md5: status.md5 };
+        const status = await statusOrEvicted(
+          ctx.client.request<{
+            finished: boolean;
+            md5?: string;
+          }>("SYNO.FileStation.MD5", "status", { taskid: started.taskid }),
+        );
+        if (!status) {
+          const result = await md5ByDownload(ctx.client, path, args.timeoutSeconds);
+          return { path, md5: result.md5, method: "download" };
+        }
+        if (status.finished) return { path, md5: status.md5, method: "dsm" };
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
 
