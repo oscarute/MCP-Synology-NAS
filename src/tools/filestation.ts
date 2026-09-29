@@ -62,9 +62,16 @@ function statusOrEvicted<T>(request: Promise<T>): Promise<T | null> {
 const MIN_HASH_BYTES_PER_SECOND = 20 * 1024 * 1024;
 
 /**
+ * Hard ceiling for the download fallback. MCP clients abort a tool call on
+ * their own (60 s is common), and a call cut off there returns nothing, so
+ * failing first with an explanation is more useful than a longer budget.
+ */
+const MAX_HASH_FALLBACK_SECONDS = 50;
+
+/**
  * Hashes the file while it streams from DSM, the fallback once the MD5 task
- * is evicted. Memory stays flat whatever the file size, and the time budget
- * grows with the size so a large file is not cut off by a small timeout.
+ * is evicted. Memory stays flat whatever the file size. The time budget grows
+ * with the size, up to MAX_HASH_FALLBACK_SECONDS.
  */
 async function md5ByDownload(
   client: DsmClient,
@@ -78,8 +85,10 @@ async function md5ByDownload(
   );
 
   const budgetMs =
-    Math.max(minSeconds, Math.ceil((contentLength ?? 0) / MIN_HASH_BYTES_PER_SECOND)) *
-    1000;
+    Math.min(
+      MAX_HASH_FALLBACK_SECONDS,
+      Math.max(minSeconds, Math.ceil((contentLength ?? 0) / MIN_HASH_BYTES_PER_SECOND)),
+    ) * 1000;
   const hash = createHash("md5");
   const reader = body.getReader();
   let bytes = 0;
@@ -105,7 +114,9 @@ async function md5ByDownload(
     throw new Error(
       `Hashing ${path} by download did not finish within ${Math.round(budgetMs / 1000)}s ` +
         `(${humanBytes(bytes)} of ${contentLength ? humanBytes(contentLength) : "unknown size"} read). ` +
-        "Raise timeoutSeconds, or check the connection to DSM.",
+        (budgetMs >= MAX_HASH_FALLBACK_SECONDS * 1000
+          ? "The file is too large to hash by download within the client's call limit; retry, since DSM's own checksum task usually succeeds."
+          : "Raise timeoutSeconds, or check the connection to DSM."),
     );
   }
   if (contentLength !== undefined && bytes !== contentLength) {
