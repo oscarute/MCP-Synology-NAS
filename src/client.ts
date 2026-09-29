@@ -297,48 +297,6 @@ export class DsmClient {
     });
   }
 
-  /**
-   * Like requestBinary, but hands back the body unread so a large file can be
-   * consumed as a stream instead of being buffered whole in memory.
-   */
-  async requestStream(
-    api: string,
-    method: string,
-    params: Record<string, unknown> = {},
-    options: RequestOptions = {},
-  ): Promise<{ body: ReadableStream<Uint8Array>; contentLength?: number }> {
-    return this.withSessionRetry(async () => {
-      const { path, version } = await this.resolve(api, options.version);
-      const url = new URL(`/webapi/${path}`, this.credentials.baseUrl);
-      url.search = buildSearchParams({
-        ...params,
-        api,
-        version,
-        method,
-        _sid: this.sid,
-      }).toString();
-
-      const response = await this.rawFetch(url, {
-        method: "GET",
-        timeoutMs: options.timeoutMs,
-      });
-
-      if ((response.headers.get("content-type") ?? "").includes("application/json")) {
-        const envelope = (await response.json()) as DsmEnvelope<unknown>;
-        this.unwrap(envelope, api, method);
-      }
-      if (!response.body) {
-        throw new Error(`DSM returned an empty body for ${api}.${method}.`);
-      }
-
-      const length = Number(response.headers.get("content-length"));
-      return {
-        body: response.body,
-        contentLength: Number.isFinite(length) && length > 0 ? length : undefined,
-      };
-    });
-  }
-
   /** Multipart upload; DSM requires the file part to be named "file". */
   async requestUpload<T = unknown>(
     api: string,
