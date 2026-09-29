@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { DsmClient } from "../client.js";
+import { SynologyError } from "../errors.js";
 import { defineTool, humanBytes, isoTime, pathParam } from "../tool.js";
 
 /** Shape of a File Station file/folder entry, trimmed to the useful fields. */
@@ -40,6 +42,101 @@ function summarizeEntry(entry: FileEntry) {
     owner: extra.owner?.user,
     group: extra.owner?.group,
   };
+}
+
+/**
+ * Some DSM builds evict a File Station background task as soon as it
+ * completes, so the status poll reports 599 "no such task" for work that
+ * actually finished. Maps that case to null; any other failure still rejects.
+ */
+function statusOrEvicted<T>(request: Promise<T>): Promise<T | null> {
+  return request.catch((error) =>
+    error instanceof SynologyError && error.code === 599
+      ? null
+      : Promise.reject(error),
+  );
+}
+
+/**
+ * The 599 is intermittent: the same MD5 task often succeeds on the next
+ * call. Polling once more after this delay recovers DSM's own result, which
+ * is far cheaper than a fallback, before giving up on the task.
+ */
+const EVICTION_RETRY_MS = 1000;
+
+/**
+ * Fresh MD5 tasks started after DSM loses one. The task that was lost is
+ * stopped first, in case a lingering task is what blocks the next.
+ */
+const MAX_MD5_RESTARTS = 2;
+
+/**
+ * MD5 tasks this server started and has not yet reported, keyed by DSM task
+ * id. get_file_checksum_result only accepts these ids, so it cannot be used
+ * to probe other DSM tasks, and it can name the file in its answer.
+ */
+const pendingChecksums = new Map<string, string>();
+const MAX_PENDING_CHECKSUMS = 100;
+
+type Md5Status = { finished: boolean; md5?: string };
+
+/** One status poll, with the single retry that recovers a transient 599. */
+async function pollMd5(client: DsmClient, taskid: string): Promise<Md5Status | null> {
+  const poll = () =>
+    statusOrEvicted(
+      client.request<Md5Status>("SYNO.FileStation.MD5", "status", { taskid }),
+    );
+  const first = await poll();
+  if (first) return first;
+  await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_MS));
+  return poll();
+}
+
+/**
+ * Sums a folder tree through the listing API: slower than the DirSize task,
+ * but unaffected by task eviction. Stops descending once the deadline passes
+ * and reports the result as incomplete.
+ */
+async function folderSizeByListing(
+  client: DsmClient,
+  root: string,
+  deadline: number,
+): Promise<{ folders: number; files: number; totalSize: number; complete: boolean }> {
+  const totals = { folders: 0, files: 0, totalSize: 0, complete: true };
+
+  const walk = async (dir: string): Promise<void> => {
+    for (let offset = 0; ; ) {
+      if (Date.now() >= deadline) {
+        totals.complete = false;
+        return;
+      }
+      const page = await client.request<{ files?: FileEntry[]; total: number }>(
+        "SYNO.FileStation.List",
+        "list",
+        {
+          folder_path: dir,
+          offset,
+          limit: 1000,
+          additional: pathParam(["size"]),
+        },
+      );
+      const entries = page.files ?? [];
+      for (const entry of entries) {
+        if (entry.isdir) {
+          totals.folders += 1;
+          await walk(entry.path);
+        } else {
+          totals.files += 1;
+          totals.totalSize += entry.additional?.size ?? 0;
+        }
+      }
+      offset += entries.length;
+      if (entries.length === 0 || offset >= (page.total ?? 0)) return;
+    }
+  };
+
+  await walk(root);
+  return totals;
 }
 
 export const fileStationReadTools = [
@@ -332,14 +429,50 @@ export const fileStationReadTools = [
       );
 
       const deadline = Date.now() + args.timeoutSeconds * 1000;
+      let retried = false;
       try {
         while (Date.now() < deadline) {
-          const status = await ctx.client.request<{
-            finished: boolean;
-            num_dir: number;
-            num_file: number;
-            total_size: number;
-          }>("SYNO.FileStation.DirSize", "status", { taskid: started.taskid });
+          const status = await statusOrEvicted(
+            ctx.client.request<{
+              finished: boolean;
+              num_dir: number;
+              num_file: number;
+              total_size: number;
+            }>("SYNO.FileStation.DirSize", "status", { taskid: started.taskid }),
+          );
+
+          if (!status && !retried) {
+            retried = true;
+            await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_MS));
+            continue;
+          }
+          if (!status) {
+            let folders = 0;
+            let files = 0;
+            let totalBytes = 0;
+            let complete = true;
+            for (const dir of paths) {
+              const sub = await folderSizeByListing(ctx.client, dir, deadline);
+              folders += sub.folders;
+              files += sub.files;
+              totalBytes += sub.totalSize;
+              complete &&= sub.complete;
+            }
+            return {
+              paths,
+              folders,
+              files,
+              totalBytes,
+              totalSize: humanBytes(totalBytes),
+              method: "listing",
+              ...(complete
+                ? {}
+                : {
+                    complete: false,
+                    note: "DSM evicted the size task and the listing walk hit the timeout, so these totals are partial. Raise timeoutSeconds for very large folders.",
+                  }),
+            };
+          }
 
           if (status.finished) {
             return {
@@ -348,6 +481,7 @@ export const fileStationReadTools = [
               files: status.num_file,
               totalBytes: status.total_size,
               totalSize: humanBytes(status.total_size),
+              method: "dsm",
             };
           }
           await new Promise((resolve) => setTimeout(resolve, 800));
@@ -371,37 +505,103 @@ export const fileStationReadTools = [
     name: "get_file_checksum",
     title: "Compute a file checksum",
     description:
-      "Computes the MD5 checksum of a file on the NAS, for verifying an upload or comparing two copies without downloading them.",
+      "Computes the MD5 checksum of a file on the NAS with a DSM background task, for verifying an upload or comparing two copies. Waits up to waitSeconds; if DSM is still hashing (large files), returns status \"running\" and a taskid to pass to get_file_checksum_result, while DSM keeps working. If DSM loses the task at start, it is restarted a limited number of times.",
     readOnly: true,
     idempotent: true,
     schema: z.object({
       path: z.string(),
-      timeoutSeconds: z.number().int().min(2).max(120).default(60),
+      // Kept well below the 60 s at which MCP clients commonly abort a call.
+      waitSeconds: z.number().int().min(1).max(50).default(20),
     }),
     handler: async (ctx, args) => {
       const path = ctx.policy.assertPathAllowed(args.path);
-      const started = await ctx.client.request<{ taskid: string }>(
-        "SYNO.FileStation.MD5",
-        "start",
-        { file_path: path },
-      );
+      const start = async (): Promise<string> =>
+        (
+          await ctx.client.request<{ taskid: string }>(
+            "SYNO.FileStation.MD5",
+            "start",
+            { file_path: path },
+          )
+        ).taskid;
+      const stop = (taskid: string): Promise<unknown> =>
+        ctx.client
+          .request("SYNO.FileStation.MD5", "stop", { taskid })
+          .catch(() => undefined);
 
-      const deadline = Date.now() + args.timeoutSeconds * 1000;
-      while (Date.now() < deadline) {
-        const status = await ctx.client.request<{
-          finished: boolean;
-          md5?: string;
-        }>("SYNO.FileStation.MD5", "status", { taskid: started.taskid });
-        if (status.finished) return { path, md5: status.md5 };
+      const deadline = Date.now() + args.waitSeconds * 1000;
+      let taskid = await start();
+      let attempts = 1;
+      for (;;) {
+        const status = await pollMd5(ctx.client, taskid);
+        if (!status) {
+          await stop(taskid);
+          if (attempts > MAX_MD5_RESTARTS) {
+            throw new Error(
+              `DSM lost the checksum task for ${path} on all ${attempts} attempts, so no checksum was produced. Retry the call; DSM's task usually succeeds on a later try.`,
+            );
+          }
+          taskid = await start();
+          attempts += 1;
+          continue;
+        }
+        if (status.finished) {
+          return { path, status: "done", md5: status.md5, attempts };
+        }
+        if (Date.now() >= deadline) break;
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
 
-      await ctx.client
-        .request("SYNO.FileStation.MD5", "stop", { taskid: started.taskid })
-        .catch(() => undefined);
-      throw new Error(
-        `Checksum for ${path} did not finish within ${args.timeoutSeconds}s. Raise timeoutSeconds for very large files.`,
-      );
+      // Still hashing: leave the task running and hand back its id.
+      if (pendingChecksums.size >= MAX_PENDING_CHECKSUMS) {
+        const oldest = pendingChecksums.keys().next().value;
+        if (oldest !== undefined) pendingChecksums.delete(oldest);
+      }
+      pendingChecksums.set(taskid, path);
+      return {
+        path,
+        status: "running",
+        taskid,
+        attempts,
+        note: "DSM is still hashing this file. Call get_file_checksum_result with this taskid in 15-30 seconds, and again until status is done.",
+      };
+    },
+  }),
+
+  defineTool({
+    name: "get_file_checksum_result",
+    title: "Get a pending file checksum",
+    description:
+      "Checks a checksum started by get_file_checksum that returned status \"running\". Returns status done with the MD5, running (check again later), or lost (DSM dropped the task; call get_file_checksum again).",
+    readOnly: true,
+    schema: z.object({
+      taskid: z.string().describe("The taskid returned by get_file_checksum"),
+    }),
+    handler: async (ctx, args) => {
+      const path = pendingChecksums.get(args.taskid);
+      if (!path) {
+        throw new Error(
+          `Unknown checksum task "${args.taskid}". It was already reported, or the server restarted since it was started. Call get_file_checksum again.`,
+        );
+      }
+
+      const status = await pollMd5(ctx.client, args.taskid);
+      if (!status) {
+        pendingChecksums.delete(args.taskid);
+        return {
+          path,
+          status: "lost",
+          note: "DSM dropped the task before it finished. Call get_file_checksum again.",
+        };
+      }
+      if (status.finished) {
+        pendingChecksums.delete(args.taskid);
+        return { path, status: "done", md5: status.md5 };
+      }
+      return {
+        path,
+        status: "running",
+        note: "Still hashing. Check again in 15-30 seconds.",
+      };
     },
   }),
 ];
