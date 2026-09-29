@@ -100,6 +100,10 @@ the read-only heuristics the curated tools apply.
 | `list_dsm_apis` | Discover every API this DSM exposes |
 | `call_dsm_api` | Invoke any DSM WebAPI method |
 
+`get_container_details` redacts values whose names suggest a credential, but
+`call_dsm_api` returns DSM's raw responses, container environments included.
+Keep `SYNOLOGY_ALLOW_GENERIC_API` off unless you need it.
+
 ## Security model
 
 The server assumes it is being driven by an AI client, so the defaults are the
