@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { DsmClient } from "../client.js";
 import { SynologyError } from "../errors.js";
@@ -61,78 +60,15 @@ function statusOrEvicted<T>(request: Promise<T>): Promise<T | null> {
 /**
  * The 599 is intermittent: the same MD5 task often succeeds on the next
  * call. Polling once more after this delay recovers DSM's own result, which
- * is far cheaper than the fallbacks, before giving up on the task.
+ * is far cheaper than a fallback, before giving up on the task.
  */
 const EVICTION_RETRY_MS = 1000;
 
-/** Slowest read speed the download fallback budgets for. */
-const MIN_HASH_BYTES_PER_SECOND = 20 * 1024 * 1024;
-
 /**
- * Hard ceiling for the download fallback. MCP clients abort a tool call on
- * their own (60 s is common), and a call cut off there returns nothing, so
- * failing first with an explanation is more useful than a longer budget.
+ * Fresh MD5 tasks started after DSM loses one. The task that was lost is
+ * stopped first, in case a lingering task is what blocks the next.
  */
-const MAX_HASH_FALLBACK_SECONDS = 50;
-
-/**
- * Hashes the file while it streams from DSM, the fallback once the MD5 task
- * is evicted. Memory stays flat whatever the file size. The time budget grows
- * with the size, up to MAX_HASH_FALLBACK_SECONDS.
- */
-async function md5ByDownload(
-  client: DsmClient,
-  path: string,
-  minSeconds: number,
-): Promise<{ md5: string; bytes: number }> {
-  const { body, contentLength } = await client.requestStream(
-    "SYNO.FileStation.Download",
-    "download",
-    { path: pathParam([path]), mode: "download" },
-  );
-
-  const budgetMs =
-    Math.min(
-      MAX_HASH_FALLBACK_SECONDS,
-      Math.max(minSeconds, Math.ceil((contentLength ?? 0) / MIN_HASH_BYTES_PER_SECOND)),
-    ) * 1000;
-  const hash = createHash("md5");
-  const reader = body.getReader();
-  let bytes = 0;
-  let timedOut = false;
-  // Cancelling the reader also resolves a read() that is stuck waiting.
-  const timer = setTimeout(() => {
-    timedOut = true;
-    void reader.cancel().catch(() => undefined);
-  }, budgetMs);
-
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      hash.update(value);
-      bytes += value.length;
-    }
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (timedOut) {
-    throw new Error(
-      `Hashing ${path} by download did not finish within ${Math.round(budgetMs / 1000)}s ` +
-        `(${humanBytes(bytes)} of ${contentLength ? humanBytes(contentLength) : "unknown size"} read). ` +
-        (budgetMs >= MAX_HASH_FALLBACK_SECONDS * 1000
-          ? "The file is too large to hash by download within the client's call limit; retry, since DSM's own checksum task usually succeeds."
-          : "Raise timeoutSeconds, or check the connection to DSM."),
-    );
-  }
-  if (contentLength !== undefined && bytes !== contentLength) {
-    throw new Error(
-      `Download of ${path} ended after ${bytes} of ${contentLength} bytes, so no checksum was produced.`,
-    );
-  }
-  return { md5: hash.digest("hex"), bytes };
-}
+const MAX_MD5_RESTARTS = 2;
 
 /**
  * Sums a folder tree through the listing API: slower than the DirSize task,
@@ -547,29 +483,40 @@ export const fileStationReadTools = [
     name: "get_file_checksum",
     title: "Compute a file checksum",
     description:
-      "Computes the MD5 checksum of a file on the NAS, for verifying an upload or comparing two copies. Runs a DSM background task; if DSM evicts the task before it can be polled, streams the file and hashes it locally instead. The result's method field says which path was used.",
+      "Computes the MD5 checksum of a file on the NAS with a DSM background task, for verifying an upload or comparing two copies. If DSM loses the task, it is restarted a limited number of times; the result's attempts field says how many were needed.",
     readOnly: true,
     idempotent: true,
     schema: z.object({
       path: z.string(),
-      timeoutSeconds: z.number().int().min(2).max(120).default(60),
+      // Below the 60 s at which MCP clients commonly abort a call, so the
+      // timeout error arrives instead of nothing.
+      timeoutSeconds: z.number().int().min(2).max(120).default(50),
     }),
     handler: async (ctx, args) => {
       const path = ctx.policy.assertPathAllowed(args.path);
-      const started = await ctx.client.request<{ taskid: string }>(
-        "SYNO.FileStation.MD5",
-        "start",
-        { file_path: path },
-      );
+      const start = async (): Promise<string> =>
+        (
+          await ctx.client.request<{ taskid: string }>(
+            "SYNO.FileStation.MD5",
+            "start",
+            { file_path: path },
+          )
+        ).taskid;
+      const stop = (taskid: string): Promise<unknown> =>
+        ctx.client
+          .request("SYNO.FileStation.MD5", "stop", { taskid })
+          .catch(() => undefined);
 
       const deadline = Date.now() + args.timeoutSeconds * 1000;
+      let taskid = await start();
+      let attempts = 1;
       let retried = false;
       while (Date.now() < deadline) {
         const status = await statusOrEvicted(
           ctx.client.request<{
             finished: boolean;
             md5?: string;
-          }>("SYNO.FileStation.MD5", "status", { taskid: started.taskid }),
+          }>("SYNO.FileStation.MD5", "status", { taskid }),
         );
         if (!status && !retried) {
           retried = true;
@@ -577,16 +524,22 @@ export const fileStationReadTools = [
           continue;
         }
         if (!status) {
-          const result = await md5ByDownload(ctx.client, path, args.timeoutSeconds);
-          return { path, md5: result.md5, method: "download" };
+          await stop(taskid);
+          if (attempts > MAX_MD5_RESTARTS) {
+            throw new Error(
+              `DSM lost the checksum task for ${path} on all ${attempts} attempts, so no checksum was produced. Retry the call; DSM's task usually succeeds on a later try.`,
+            );
+          }
+          taskid = await start();
+          attempts += 1;
+          retried = false;
+          continue;
         }
-        if (status.finished) return { path, md5: status.md5, method: "dsm" };
+        if (status.finished) return { path, md5: status.md5, attempts };
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
 
-      await ctx.client
-        .request("SYNO.FileStation.MD5", "stop", { taskid: started.taskid })
-        .catch(() => undefined);
+      await stop(taskid);
       throw new Error(
         `Checksum for ${path} did not finish within ${args.timeoutSeconds}s. Raise timeoutSeconds for very large files.`,
       );
