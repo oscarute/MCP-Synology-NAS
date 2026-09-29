@@ -58,6 +58,13 @@ function statusOrEvicted<T>(request: Promise<T>): Promise<T | null> {
   );
 }
 
+/**
+ * The 599 is intermittent: the same MD5 task often succeeds on the next
+ * call. Polling once more after this delay recovers DSM's own result, which
+ * is far cheaper than the fallbacks, before giving up on the task.
+ */
+const EVICTION_RETRY_MS = 1000;
+
 /** Slowest read speed the download fallback budgets for. */
 const MIN_HASH_BYTES_PER_SECOND = 20 * 1024 * 1024;
 
@@ -464,6 +471,7 @@ export const fileStationReadTools = [
       );
 
       const deadline = Date.now() + args.timeoutSeconds * 1000;
+      let retried = false;
       try {
         while (Date.now() < deadline) {
           const status = await statusOrEvicted(
@@ -475,6 +483,11 @@ export const fileStationReadTools = [
             }>("SYNO.FileStation.DirSize", "status", { taskid: started.taskid }),
           );
 
+          if (!status && !retried) {
+            retried = true;
+            await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_MS));
+            continue;
+          }
           if (!status) {
             let folders = 0;
             let files = 0;
@@ -550,6 +563,7 @@ export const fileStationReadTools = [
       );
 
       const deadline = Date.now() + args.timeoutSeconds * 1000;
+      let retried = false;
       while (Date.now() < deadline) {
         const status = await statusOrEvicted(
           ctx.client.request<{
@@ -557,6 +571,11 @@ export const fileStationReadTools = [
             md5?: string;
           }>("SYNO.FileStation.MD5", "status", { taskid: started.taskid }),
         );
+        if (!status && !retried) {
+          retried = true;
+          await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_MS));
+          continue;
+        }
         if (!status) {
           const result = await md5ByDownload(ctx.client, path, args.timeoutSeconds);
           return { path, md5: result.md5, method: "download" };
