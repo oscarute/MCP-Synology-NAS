@@ -87,9 +87,10 @@ the read-only heuristics the curated tools apply.
 
 `control_project` `update` downloads newer images while the project keeps
 running, then stops the whole project and rebuilds it, and then deletes
-the previous images once unused (needs `SYNOLOGY_ALLOW_DELETE`). Standalone
-containers left on a replaced `latest` image are then handed to Container
-Manager's own image update. It refuses the project that runs this server,
+the previous images once unused (needs `SYNOLOGY_ALLOW_DELETE`). When standalone
+containers share an outdated `latest` image, the affected projects are stopped
+first and Container Manager's own image update downloads it and recreates
+those containers; the projects are then rebuilt as usual. It refuses the project that runs this server,
 since that would cut the connection.
 
 `control_container` `update` uses Container Manager's image update for a

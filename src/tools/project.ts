@@ -115,40 +115,67 @@ async function findProject(client: DsmClient, name: string): Promise<Project> {
   return project;
 }
 
-type PendingPull = {
+/**
+ * One image to refresh. "pull" downloads it with pull_start while the
+ * projects keep running. "upgrade" hands it to Container Manager's image
+ * update, which is the only way to recreate standalone containers: it runs
+ * after every affected project is stopped, so it never recreates a
+ * container of a running project.
+ */
+type PendingImage = {
   repository: string;
   tag: string;
-  /** Empty when the newer image was already downloaded, e.g. by another update. */
+  via: "pull" | "upgrade";
+  /** Empty until started, or for a newer image that is already downloaded. */
   taskId: string;
   oldImageId: string;
   finished: boolean;
+  /** When polling started, to detect a task DSM never reports on. */
+  since: number;
+  sawStatus: boolean;
 };
 
 type PendingUpdate = {
   project: Project;
-  pulls: PendingPull[];
+  images: PendingImage[];
+  phase: "download" | "upgrade";
+  /** Projects stopped before the upgrade phase, rebuilt at the end. */
+  affected?: Project[];
   allowDelete: boolean;
 };
 
 const pendingUpdates = new Map<string, PendingUpdate>();
 const MAX_PENDING_UPDATES = 20;
+// DSM answers a task's status with no data while it sets the task up. A task
+// that never reports anything is treated as stuck after this long.
+const SILENT_TASK_LIMIT_MS = 5 * 60_000;
 
 /**
- * Returns false while any pull is still downloading. Throws if one failed.
- * Right after pull_start DSM can answer with no data at all while the task
- * is still being set up; that counts as not finished yet.
+ * Polls the pending tasks of one kind. Returns false while any is running and
+ * throws when DSM reports an error or a task stays silent for too long.
  */
-async function pollPulls(client: DsmClient, pulls: PendingPull[]): Promise<boolean> {
-  for (const pull of pulls) {
-    if (pull.finished || !pull.taskId) continue;
+async function pollTasks(
+  client: DsmClient,
+  entries: PendingImage[],
+  method: "pull_status" | "upgrade_status",
+): Promise<boolean> {
+  for (const entry of entries) {
+    if (entry.finished || !entry.taskId) continue;
     const status = await client.request<{ finished?: boolean } | undefined>(
       "SYNO.Docker.Image",
-      "pull_status",
-      { task_id: pull.taskId },
+      method,
+      { task_id: entry.taskId },
+      { version: 1 },
     );
-    pull.finished = status?.finished === true;
+    if (status) entry.sawStatus = true;
+    entry.finished = status?.finished === true;
+    if (!entry.sawStatus && Date.now() - entry.since > SILENT_TASK_LIMIT_MS) {
+      throw new Error(
+        `DSM never reported on the ${method === "pull_status" ? "download" : "update"} of ${entry.repository}:${entry.tag}. Check Container Manager, and Docker Hub's pull rate limit.`,
+      );
+    }
   }
-  return pulls.every((pull) => pull.finished);
+  return entries.every((entry) => entry.finished);
 }
 
 /** Stops and rebuilds one project, as Container Manager does for a build. */
@@ -168,27 +195,59 @@ async function rebuildProject(client: DsmClient, project: Project): Promise<stri
   return `${stop.log ?? ""}${build.log ?? ""}`;
 }
 
-/**
- * Rebuilds every project that runs one of the replaced images, not only the
- * requested one, so no project is left on an old image next to an updated
- * one. Each project is fully stopped before its build. Then checks that the
- * containers switched and removes the previous images once nothing uses them.
- */
-async function finishUpdate(client: DsmClient, update: PendingUpdate) {
-  const { project, pulls } = update;
-  const oldIds = new Set(pulls.map((pull) => pull.oldImageId));
-  const [projects, before] = await Promise.all([
-    listProjects(client),
-    listAllContainers(client),
-  ]);
-  const affected = [
-    project,
+/** The requested project plus every project running one of the old images. */
+async function affectedProjects(client: DsmClient, update: PendingUpdate): Promise<Project[]> {
+  const oldIds = new Set(update.images.map((entry) => entry.oldImageId));
+  const [projects, containers] = await Promise.all([listProjects(client), listAllContainers(client)]);
+  return [
+    update.project,
     ...projects.filter(
       (candidate) =>
-        candidate.id !== project.id &&
-        projectContainers(candidate, before).some((container) => oldIds.has(container.ImageID)),
+        candidate.id !== update.project.id &&
+        projectContainers(candidate, containers).some((container) => oldIds.has(container.ImageID)),
     ),
   ];
+}
+
+/**
+ * Upgrade phase: stops every affected project, then lets Container Manager
+ * download the images and recreate the containers on them. Project
+ * containers are rebuilt with Compose afterwards anyway.
+ */
+async function startUpgradePhase(client: DsmClient, update: PendingUpdate) {
+  update.affected = await affectedProjects(client, update);
+  for (const target of update.affected) {
+    if (isOwnProject(target)) continue;
+    await client.request(
+      "SYNO.Docker.Project",
+      "stop",
+      { id: target.id },
+      { method: "POST", timeoutMs: PROJECT_TIMEOUT_MS },
+    );
+  }
+  for (const entry of update.images) {
+    if (entry.via !== "upgrade") continue;
+    const { task_id } = await client.request<{ task_id: string }>(
+      "SYNO.Docker.Image",
+      "upgrade_start",
+      { repository: entry.repository },
+      { method: "POST", version: 1 },
+    );
+    entry.taskId = task_id;
+    entry.since = Date.now();
+  }
+  update.phase = "upgrade";
+}
+
+/**
+ * Rebuilds every affected project, each fully stopped before its build, so no
+ * project is left on an old image next to an updated one. Then checks that
+ * the containers switched and removes the previous images once unused.
+ */
+async function finishUpdate(client: DsmClient, update: PendingUpdate) {
+  const { project } = update;
+  const oldIds = new Set(update.images.map((entry) => entry.oldImageId));
+  const affected = update.affected ?? (await affectedProjects(client, update));
 
   const rebuilt = [];
   const skipped = [];
@@ -200,60 +259,43 @@ async function finishUpdate(client: DsmClient, update: PendingUpdate) {
     rebuilt.push({ project: target.name, log: await rebuildProject(client, target) });
   }
 
-  const containers = await listAllContainers(client);
-  const images = await listImages(client);
+  const [projects, containers, images] = await Promise.all([
+    listProjects(client),
+    listAllContainers(client),
+    listImages(client),
+  ]);
   const inUse = new Set(containers.map((container) => container.ImageID));
-  const standalone = containers.filter(
-    (container) =>
-      oldIds.has(container.ImageID) &&
-      !projects.some((candidate) => projectContainers(candidate, [container]).length > 0),
-  );
-
-  // Once every project is rebuilt, Container Manager's own update can
-  // recreate the standalone containers left on a replaced latest image.
-  const standaloneUpdates = [];
-  const standaloneLeft = [];
-  for (const pull of pulls) {
-    const onOld = containers.filter((container) => container.ImageID === pull.oldImageId);
-    const solo = onOld.filter((container) => standalone.includes(container));
-    if (solo.length === 0) continue;
-    const onlyStandalone = solo.length === onOld.length && !solo.some((c) => c.id.startsWith(hostname()));
-    if (pull.tag === "latest" && onlyStandalone) {
-      const updateId = await startUpgrade(
-        client,
-        pull.repository,
-        solo.map((container) => container.name),
-        pull.oldImageId,
-      );
-      standaloneUpdates.push({ updateId, containers: solo.map((container) => container.name) });
-    } else {
-      standaloneLeft.push(...solo.map((container) => container.name));
-    }
-  }
+  const standaloneLeft = containers
+    .filter(
+      (container) =>
+        oldIds.has(container.ImageID) &&
+        !projects.some((candidate) => projectContainers(candidate, [container]).length > 0),
+    )
+    .map((container) => container.name);
 
   const updated = [];
-  for (const pull of pulls) {
-    const reference = `${pull.repository}:${pull.tag}`;
+  for (const entry of update.images) {
+    const reference = `${entry.repository}:${entry.tag}`;
     const current = taggedImage(images, reference);
-    const changed = current !== undefined && current.id !== pull.oldImageId;
+    const changed = current !== undefined && current.id !== entry.oldImageId;
     const stillOld = containers
-      .filter((container) => container.ImageID === pull.oldImageId)
+      .filter((container) => container.ImageID === entry.oldImageId)
       .map((container) => container.name);
 
     let oldImage: string;
     if (!changed) {
       oldImage = "no newer image was downloaded";
-    } else if (standaloneUpdates.some((u) => pendingUpgrades.get(u.updateId)?.oldImageId === pull.oldImageId)) {
-      oldImage = "Container Manager deletes it after updating the standalone containers";
-    } else if (inUse.has(pull.oldImageId)) {
+    } else if (inUse.has(entry.oldImageId)) {
       oldImage = `kept, still used by ${stillOld.join(", ")}`;
+    } else if (!images.some((image) => image.id === entry.oldImageId)) {
+      oldImage = entry.via === "upgrade" ? "removed by Container Manager" : "already removed";
     } else if (!update.allowDelete) {
       oldImage = "kept, SYNOLOGY_ALLOW_DELETE is false";
     } else {
-      oldImage = await deleteImage(client, pull.oldImageId, images);
+      oldImage = await deleteImage(client, entry.oldImageId, images);
     }
 
-    updated.push({ image: reference, changed, oldImage });
+    updated.push({ image: reference, changed, via: entry.via, oldImage });
   }
 
   return {
@@ -261,16 +303,10 @@ async function finishUpdate(client: DsmClient, update: PendingUpdate) {
     status: "done",
     rebuiltProjects: rebuilt,
     ...(skipped.length > 0 ? { skippedProjects: skipped } : {}),
-    ...(standaloneUpdates.length > 0
-      ? {
-          standaloneUpdates,
-          note: "Container Manager is now updating the standalone containers that ran the previous image, and will delete that image. Poll get_project_update_result with each updateId until status is done.",
-        }
-      : {}),
     ...(standaloneLeft.length > 0
       ? {
           standaloneContainersOnOldImage: standaloneLeft,
-          standaloneNote: "These containers are not part of a project and could not be updated automatically (not a latest tag), so they still run the previous image.",
+          standaloneNote: "These containers are not part of a project and still run the previous image. Recreate them from Container Manager.",
         }
       : {}),
     images: updated,
@@ -297,13 +333,16 @@ async function deleteImage(client: DsmClient, imageId: string, images: Image[]):
  * Container Manager's image "Update": pulls the repository's latest tag,
  * recreates every container on the previous image with the same settings and
  * deletes that image. It recreates project containers one by one without
- * stopping their project, so it is only used for standalone containers.
+ * stopping their project, so control_container only uses it when no project
+ * shares the image; control_project stops the projects before using it.
  */
 type PendingUpgrade = {
   repository: string;
   taskId: string;
   containers: string[];
   oldImageId: string;
+  since: number;
+  sawStatus: boolean;
 };
 
 const pendingUpgrades = new Map<string, PendingUpgrade>();
@@ -324,7 +363,14 @@ async function startUpgrade(
     const oldest = pendingUpgrades.keys().next().value;
     if (oldest !== undefined) pendingUpgrades.delete(oldest);
   }
-  pendingUpgrades.set(task_id, { repository, taskId: task_id, containers, oldImageId });
+  pendingUpgrades.set(task_id, {
+    repository,
+    taskId: task_id,
+    containers,
+    oldImageId,
+    since: Date.now(),
+    sawStatus: false,
+  });
   return task_id;
 }
 
@@ -337,12 +383,19 @@ async function waitForUpgrade(
   const deadline = Date.now() + waitSeconds * 1000;
   let state = "";
   for (;;) {
+    if (!upgrade.sawStatus && Date.now() - upgrade.since > SILENT_TASK_LIMIT_MS) {
+      pendingUpgrades.delete(updateId);
+      throw new Error(
+        `Container Manager never reported on the update of ${upgrade.repository}. Check Container Manager, and Docker Hub's pull rate limit.`,
+      );
+    }
     const status = await client.request<{ finished?: boolean; state?: string } | undefined>(
       "SYNO.Docker.Image",
       "upgrade_status",
       { task_id: upgrade.taskId },
       { version: 1 },
     );
+    if (status) upgrade.sawStatus = true;
     state = status?.state ?? state;
     if (status?.finished) {
       pendingUpgrades.delete(updateId);
@@ -420,6 +473,12 @@ export async function updateStandaloneContainer(ctx: ToolContext, name: string, 
       note: "Container Manager reports no newer image for this container.",
     };
   }
+  const image = images.find((candidate) => candidate.id === container.ImageID);
+  if (!image?.upgradable) {
+    throw new Error(
+      `${container.image} already points at a newer image that "${name}" does not run yet. Container Manager's update only acts while the tag itself is outdated, so recreate "${name}" from Container Manager.`,
+    );
+  }
   const users = containers
     .filter((candidate) => candidate.ImageID === container.ImageID)
     .map((candidate) => candidate.name);
@@ -434,20 +493,40 @@ async function waitForUpdate(
   waitSeconds: number,
 ) {
   const deadline = Date.now() + waitSeconds * 1000;
-  for (;;) {
-    if (await pollPulls(client, update.pulls)) {
-      pendingUpdates.delete(updateId);
-      return finishUpdate(client, update);
+  try {
+    for (;;) {
+      if (update.phase === "download") {
+        const pulls = update.images.filter((entry) => entry.via === "pull");
+        if (await pollTasks(client, pulls, "pull_status")) {
+          if (!update.images.some((entry) => entry.via === "upgrade")) {
+            pendingUpdates.delete(updateId);
+            return await finishUpdate(client, update);
+          }
+          await startUpgradePhase(client, update);
+        }
+      } else {
+        const upgrades = update.images.filter((entry) => entry.via === "upgrade");
+        if (await pollTasks(client, upgrades, "upgrade_status")) {
+          pendingUpdates.delete(updateId);
+          return await finishUpdate(client, update);
+        }
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
-    if (Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+  } catch (error) {
+    pendingUpdates.delete(updateId);
+    throw error;
   }
   return {
     project: update.project.name,
-    status: "downloading",
+    status: update.phase === "download" ? "downloading" : "updating",
     updateId,
-    images: update.pulls.map((pull) => `${pull.repository}:${pull.tag}`),
-    note: "The project keeps running while the new images download. Call get_project_update_result with this updateId in about a minute, and again until status is done.",
+    images: update.images.map((entry) => `${entry.repository}:${entry.tag}`),
+    note:
+      update.phase === "download"
+        ? "The project keeps running while the new images download. Call get_project_update_result with this updateId in about a minute, and again until status is done."
+        : "The affected projects are stopped while Container Manager downloads the images and recreates the standalone containers. Call get_project_update_result with this updateId in about a minute, and again until status is done.",
   };
 }
 
@@ -488,7 +567,7 @@ export const projectTools = [
     name: "control_project",
     title: "Start, stop, build, clean or update a project",
     description:
-      "Starts or stops a Container Manager project, builds it (stops it and recreates its containers from compose.yaml, like Container Manager's Build), cleans it (stops it and removes its containers, keeping the project files), or updates it. update downloads newer versions of the project's images while it keeps running, then stops and rebuilds the whole project, and every other project that runs the same old images, so all containers use the new images, and removes the previous images once unused (needs SYNOLOGY_ALLOW_DELETE=true for that last step). Downloads can take minutes: if update returns status \"downloading\", poll get_project_update_result with the updateId. The project that runs this server cannot be controlled. Requires SYNOLOGY_ALLOW_SYSTEM_CONTROL=true.",
+      "Starts or stops a Container Manager project, builds it (stops it and recreates its containers from compose.yaml, like Container Manager's Build), cleans it (stops it and removes its containers, keeping the project files), or updates it. update downloads newer versions of the project's images while it keeps running, then stops and rebuilds the whole project, and every other project that runs the same old images, so all containers use the new images, and removes the previous images once unused (needs SYNOLOGY_ALLOW_DELETE=true for that last step). If standalone containers share an outdated latest image, the affected projects are stopped first and Container Manager's image update downloads it and recreates those containers. Downloads can take minutes: if update returns status \"downloading\", poll get_project_update_result with the updateId. The project that runs this server cannot be controlled. Requires SYNOLOGY_ALLOW_SYSTEM_CONTROL=true.",
     destructive: true,
     schema: z.object({
       name: z.string().describe("Project name as shown by list_projects"),
@@ -534,19 +613,39 @@ export const projectTools = [
         };
       }
 
+      // An update already in progress for this project is resumed, not doubled.
+      for (const [pendingId, pending] of pendingUpdates) {
+        if (pending.project.id === project.id) {
+          return waitForUpdate(ctx.client, pendingId, pending, args.waitSeconds);
+        }
+      }
+
       const [containers, images] = await Promise.all([
         listAllContainers(ctx.client),
         listImages(ctx.client),
       ]);
-      const pulls: PendingPull[] = [];
+      const projects = await listProjects(ctx.client);
+      const entries: PendingImage[] = [];
       for (const container of projectContainers(project, containers)) {
         if (!needsUpdate(container, images)) continue;
         const [repository, tag] = splitReference(container.image);
-        if (pulls.some((pull) => pull.repository === repository && pull.tag === tag)) continue;
+        if (entries.some((entry) => entry.repository === repository && entry.tag === tag)) continue;
+        const base = { repository, tag, oldImageId: container.ImageID, since: Date.now(), sawStatus: false };
         const current = taggedImage(images, container.image);
         if (current && current.id !== container.ImageID) {
           // Newer image already on the NAS: rebuild without downloading again.
-          pulls.push({ repository, tag, taskId: "", oldImageId: container.ImageID, finished: true });
+          entries.push({ ...base, via: "pull", taskId: "", finished: true });
+          continue;
+        }
+        // Standalone containers on the same image can only be recreated by
+        // Container Manager's update, which must pull the image itself.
+        const standalone = containers.some(
+          (other) =>
+            other.ImageID === container.ImageID &&
+            !projects.some((candidate) => projectContainers(candidate, [other]).length > 0),
+        );
+        if (standalone && tag === "latest") {
+          entries.push({ ...base, via: "upgrade", taskId: "", finished: false });
           continue;
         }
         const { task_id } = await ctx.client.request<{ task_id: string }>(
@@ -555,10 +654,10 @@ export const projectTools = [
           { repository, tag },
           { method: "POST" },
         );
-        pulls.push({ repository, tag, taskId: task_id, oldImageId: container.ImageID, finished: false });
+        entries.push({ ...base, via: "pull", taskId: task_id, finished: false });
       }
 
-      if (pulls.length === 0) {
+      if (entries.length === 0) {
         return {
           project: project.name,
           status: "up_to_date",
@@ -566,12 +665,18 @@ export const projectTools = [
         };
       }
 
-      const updateId = pulls.find((pull) => pull.taskId)?.taskId ?? `local-${project.id}-${Date.now()}`;
+      const updateId =
+        entries.find((entry) => entry.taskId)?.taskId ?? `local-${project.id}-${Date.now()}`;
       if (pendingUpdates.size >= MAX_PENDING_UPDATES) {
         const oldest = pendingUpdates.keys().next().value;
         if (oldest !== undefined) pendingUpdates.delete(oldest);
       }
-      const update = { project, pulls, allowDelete: ctx.policy.allowDelete };
+      const update: PendingUpdate = {
+        project,
+        images: entries,
+        phase: "download",
+        allowDelete: ctx.policy.allowDelete,
+      };
       pendingUpdates.set(updateId, update);
       return waitForUpdate(ctx.client, updateId, update, args.waitSeconds);
     },
@@ -581,7 +686,7 @@ export const projectTools = [
     name: "get_project_update_result",
     title: "Check a project update",
     description:
-      "Continues an update started by control_project (status \"downloading\") or control_container (status \"updating\"), or a standaloneUpdates entry. Once the images are downloaded it recreates the containers and removes the previous images, then returns status done.",
+      "Continues an update started by control_project (status \"downloading\" or \"updating\") or control_container (status \"updating\"). Once the images are downloaded it recreates the containers and removes the previous images, then returns status done.",
     destructive: true,
     schema: z.object({
       updateId: z.string().describe("The updateId returned by control_project or control_container"),
