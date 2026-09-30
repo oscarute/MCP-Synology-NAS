@@ -193,7 +193,7 @@ async function deleteImage(client: DsmClient, imageId: string, images: Image[]):
   await client.request(
     "SYNO.Docker.Image",
     "delete",
-    { images: [{ id: image.id, repository: image.repository, tags: image.tags }] },
+    { images: [{ identity: image.id }] },
     { method: "POST" },
   );
   const remaining = await listImages(client);
