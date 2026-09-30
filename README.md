@@ -319,4 +319,4 @@ and *DSM Login Web API* guides, plus runtime discovery via `SYNO.API.Info`.
 
 ## License
 
-MIT
+[MIT](LICENSE). Originally created by [Mrquj](https://github.com/Mrquj/mcp-server-synology).
