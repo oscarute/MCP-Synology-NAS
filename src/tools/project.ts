@@ -133,16 +133,20 @@ type PendingUpdate = {
 const pendingUpdates = new Map<string, PendingUpdate>();
 const MAX_PENDING_UPDATES = 20;
 
-/** Returns false while any pull is still downloading. Throws if one failed. */
+/**
+ * Returns false while any pull is still downloading. Throws if one failed.
+ * Right after pull_start DSM can answer with no data at all while the task
+ * is still being set up; that counts as not finished yet.
+ */
 async function pollPulls(client: DsmClient, pulls: PendingPull[]): Promise<boolean> {
   for (const pull of pulls) {
     if (pull.finished || !pull.taskId) continue;
-    const status = await client.request<{ finished: boolean }>(
+    const status = await client.request<{ finished?: boolean } | undefined>(
       "SYNO.Docker.Image",
       "pull_status",
       { task_id: pull.taskId },
     );
-    pull.finished = status.finished === true;
+    pull.finished = status?.finished === true;
   }
   return pulls.every((pull) => pull.finished);
 }
@@ -333,14 +337,14 @@ async function waitForUpgrade(
   const deadline = Date.now() + waitSeconds * 1000;
   let state = "";
   for (;;) {
-    const status = await client.request<{ finished: boolean; state?: string }>(
+    const status = await client.request<{ finished?: boolean; state?: string } | undefined>(
       "SYNO.Docker.Image",
       "upgrade_status",
       { task_id: upgrade.taskId },
       { version: 1 },
     );
-    state = status.state ?? state;
-    if (status.finished) {
+    state = status?.state ?? state;
+    if (status?.finished) {
       pendingUpgrades.delete(updateId);
       const [containers, images] = await Promise.all([
         listAllContainers(client),
