@@ -5,6 +5,7 @@ import { fileStationReadTools } from "./filestation.js";
 import { fileStationWriteTools } from "./filestation-write.js";
 import { genericTools } from "./generic.js";
 import { photoTools } from "./photos.js";
+import { projectTools } from "./project.js";
 import { systemTools } from "./system.js";
 
 /** Every tool the server can expose, before policy filtering. */
@@ -14,6 +15,7 @@ export const allTools: ToolDef[] = [
   ...downloadStationTools,
   ...photoTools,
   ...containerTools,
+  ...projectTools,
   ...systemTools,
   ...genericTools,
 ];

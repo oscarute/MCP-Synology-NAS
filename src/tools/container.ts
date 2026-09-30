@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineTool, humanBytes } from "../tool.js";
+import { updateStandaloneContainer } from "./project.js";
 
 const REDACTED = "[redacted]";
 
@@ -110,15 +111,20 @@ export const containerTools = [
 
   defineTool({
     name: "control_container",
-    title: "Start, stop or restart a container",
+    title: "Start, stop, restart or update a container",
     description:
-      "Starts, stops or restarts a Docker container on the NAS. Stopping a container takes whatever it serves offline. Requires SYNOLOGY_ALLOW_SYSTEM_CONTROL=true.",
+      "Starts, stops or restarts a Docker container on the NAS, or updates a standalone container (one not in a project) on a latest tag with Container Manager's image update, which downloads the new image, recreates the container with the same settings and deletes the old image. Containers in a project must be updated with control_project. Stopping a container takes whatever it serves offline. Requires SYNOLOGY_ALLOW_SYSTEM_CONTROL=true.",
     destructive: true,
     schema: z.object({
       name: z.string(),
-      action: z.enum(["start", "stop", "restart"]),
+      action: z.enum(["start", "stop", "restart", "update"]),
+      // Kept well below the 60 s at which MCP clients commonly abort a call.
+      waitSeconds: z.number().int().min(1).max(30).default(20),
     }),
     handler: async (ctx, args) => {
+      if (args.action === "update") {
+        return updateStandaloneContainer(ctx, args.name, args.waitSeconds);
+      }
       ctx.policy.assertSystemControl(`control_container(${args.action})`);
       await ctx.client.request(
         "SYNO.Docker.Container",
@@ -150,6 +156,7 @@ export const containerTools = [
       return {
         total: data.total,
         images: (data.images ?? []).map((image: any) => ({
+          id: image.id,
           repository: image.repository,
           tags: image.tags,
           size: humanBytes(Number(image.virtual_size ?? image.size ?? 0)),

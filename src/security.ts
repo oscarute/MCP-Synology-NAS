@@ -33,6 +33,10 @@ export class SecurityPolicy {
     return this.options.maxReadBytes;
   }
 
+  get allowDelete(): boolean {
+    return !this.options.readOnly && this.options.allowDelete;
+  }
+
   get allowGenericApi(): boolean {
     return this.options.allowGenericApi;
   }

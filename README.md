@@ -78,8 +78,25 @@ the read-only heuristics the curated tools apply.
 | --- | --- |
 | `list_containers` | Containers with state, CPU and memory |
 | `get_container_details` | Ports, mounts, environment, network |
-| `control_container` | Start, stop or restart |
-| `list_container_images` | Stored images and their size |
+| `control_container` | Start, stop, restart, or update a standalone container |
+| `list_container_images` | Stored images, their id and size |
+| `delete_container_image` | Delete an image no container uses |
+| `list_projects` | Projects with their containers and available image updates |
+| `control_project` | Start, stop, build, clean or update a project |
+| `get_project_update_result` | Continue an update while new images download |
+
+`control_project` `update` downloads newer images while the project keeps
+running, then stops the whole project and rebuilds it, and then deletes
+the previous images once unused (needs `SYNOLOGY_ALLOW_DELETE`). When standalone
+containers share an outdated `latest` image, the affected projects are stopped
+first and Container Manager's own image update downloads it and recreates
+those containers; the projects are then rebuilt as usual. It refuses the project that runs this server,
+since that would cut the connection.
+
+`control_container` `update` uses Container Manager's image update for a
+standalone container on a `latest` tag. It refuses containers in a project,
+and images that a project also uses, because Container Manager would recreate
+those containers without stopping their project.
 
 ### System
 
