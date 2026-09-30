@@ -82,11 +82,11 @@ the read-only heuristics the curated tools apply.
 | `list_container_images` | Stored images, their id and size |
 | `delete_container_image` | Delete an image no container uses |
 | `list_projects` | Projects with their containers and available image updates |
-| `control_project` | Start, stop or update a project |
+| `control_project` | Start, stop, build, clean or update a project |
 | `get_project_update_result` | Continue an update while new images download |
 
 `control_project` `update` downloads newer images while the project keeps
-running, recreates only the containers whose image changed, and then deletes
+running, then stops the whole project and rebuilds it, and then deletes
 the previous images once unused (needs `SYNOLOGY_ALLOW_DELETE`). It refuses
 the project that runs this server, since that would cut the connection.
 
