@@ -150,6 +150,7 @@ export const containerTools = [
       return {
         total: data.total,
         images: (data.images ?? []).map((image: any) => ({
+          id: image.id,
           repository: image.repository,
           tags: image.tags,
           size: humanBytes(Number(image.virtual_size ?? image.size ?? 0)),

@@ -45,7 +45,7 @@ services:
       SYNOLOGY_READONLY: "true"
       # Permanently deleting files, gated separately from ordinary writes.
       SYNOLOGY_ALLOW_DELETE: "false"
-      # Restart/shutdown DSM, control containers, change service state.
+      # Restart/shutdown DSM, control containers and projects, change service state.
       SYNOLOGY_ALLOW_SYSTEM_CONTROL: "false"
       # Raw DSM WebAPI escape hatch (dsm_api_call).
       SYNOLOGY_ALLOW_GENERIC_API: "false"
