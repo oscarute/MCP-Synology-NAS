@@ -1,7 +1,7 @@
 import { hostname } from "node:os";
 import { z } from "zod";
 import type { DsmClient } from "../client.js";
-import { defineTool, humanBytes } from "../tool.js";
+import { defineTool, humanBytes, type ToolContext } from "../tool.js";
 
 /**
  * Container Manager projects (Docker Compose) on DSM 7.2. These APIs are not
@@ -205,6 +205,28 @@ async function finishUpdate(client: DsmClient, update: PendingUpdate) {
       !projects.some((candidate) => projectContainers(candidate, [container]).length > 0),
   );
 
+  // Once every project is rebuilt, Container Manager's own update can
+  // recreate the standalone containers left on a replaced latest image.
+  const standaloneUpdates = [];
+  const standaloneLeft = [];
+  for (const pull of pulls) {
+    const onOld = containers.filter((container) => container.ImageID === pull.oldImageId);
+    const solo = onOld.filter((container) => standalone.includes(container));
+    if (solo.length === 0) continue;
+    const onlyStandalone = solo.length === onOld.length && !solo.some((c) => c.id.startsWith(hostname()));
+    if (pull.tag === "latest" && onlyStandalone) {
+      const updateId = await startUpgrade(
+        client,
+        pull.repository,
+        solo.map((container) => container.name),
+        pull.oldImageId,
+      );
+      standaloneUpdates.push({ updateId, containers: solo.map((container) => container.name) });
+    } else {
+      standaloneLeft.push(...solo.map((container) => container.name));
+    }
+  }
+
   const updated = [];
   for (const pull of pulls) {
     const reference = `${pull.repository}:${pull.tag}`;
@@ -217,6 +239,8 @@ async function finishUpdate(client: DsmClient, update: PendingUpdate) {
     let oldImage: string;
     if (!changed) {
       oldImage = "no newer image was downloaded";
+    } else if (standaloneUpdates.some((u) => pendingUpgrades.get(u.updateId)?.oldImageId === pull.oldImageId)) {
+      oldImage = "Container Manager deletes it after updating the standalone containers";
     } else if (inUse.has(pull.oldImageId)) {
       oldImage = `kept, still used by ${stillOld.join(", ")}`;
     } else if (!update.allowDelete) {
@@ -233,10 +257,16 @@ async function finishUpdate(client: DsmClient, update: PendingUpdate) {
     status: "done",
     rebuiltProjects: rebuilt,
     ...(skipped.length > 0 ? { skippedProjects: skipped } : {}),
-    ...(standalone.length > 0
+    ...(standaloneUpdates.length > 0
       ? {
-          standaloneContainersOnOldImage: standalone.map((container) => container.name),
-          note: "These containers are not part of a project, so they still run the previous image.",
+          standaloneUpdates,
+          note: "Container Manager is now updating the standalone containers that ran the previous image, and will delete that image. Poll get_project_update_result with each updateId until status is done.",
+        }
+      : {}),
+    ...(standaloneLeft.length > 0
+      ? {
+          standaloneContainersOnOldImage: standaloneLeft,
+          standaloneNote: "These containers are not part of a project and could not be updated automatically (not a latest tag), so they still run the previous image.",
         }
       : {}),
     images: updated,
@@ -257,6 +287,140 @@ async function deleteImage(client: DsmClient, imageId: string, images: Image[]):
   return remaining.some((candidate) => candidate.id === imageId)
     ? "kept, DSM did not remove it"
     : `removed (${humanBytes(image.size)} freed)`;
+}
+
+/**
+ * Container Manager's image "Update": pulls the repository's latest tag,
+ * recreates every container on the previous image with the same settings and
+ * deletes that image. It recreates project containers one by one without
+ * stopping their project, so it is only used for standalone containers.
+ */
+type PendingUpgrade = {
+  repository: string;
+  taskId: string;
+  containers: string[];
+  oldImageId: string;
+};
+
+const pendingUpgrades = new Map<string, PendingUpgrade>();
+
+async function startUpgrade(
+  client: DsmClient,
+  repository: string,
+  containers: string[],
+  oldImageId: string,
+): Promise<string> {
+  const { task_id } = await client.request<{ task_id: string }>(
+    "SYNO.Docker.Image",
+    "upgrade_start",
+    { repository },
+    { method: "POST", version: 1 },
+  );
+  if (pendingUpgrades.size >= MAX_PENDING_UPDATES) {
+    const oldest = pendingUpgrades.keys().next().value;
+    if (oldest !== undefined) pendingUpgrades.delete(oldest);
+  }
+  pendingUpgrades.set(task_id, { repository, taskId: task_id, containers, oldImageId });
+  return task_id;
+}
+
+async function waitForUpgrade(
+  client: DsmClient,
+  updateId: string,
+  upgrade: PendingUpgrade,
+  waitSeconds: number,
+) {
+  const deadline = Date.now() + waitSeconds * 1000;
+  let state = "";
+  for (;;) {
+    const status = await client.request<{ finished: boolean; state?: string }>(
+      "SYNO.Docker.Image",
+      "upgrade_status",
+      { task_id: upgrade.taskId },
+      { version: 1 },
+    );
+    state = status.state ?? state;
+    if (status.finished) {
+      pendingUpgrades.delete(updateId);
+      const [containers, images] = await Promise.all([
+        listAllContainers(client),
+        listImages(client),
+      ]);
+      return {
+        repository: upgrade.repository,
+        status: "done",
+        containers: upgrade.containers.map((name) => {
+          const container = containers.find((candidate) => candidate.name === name);
+          return {
+            name,
+            status: container?.status ?? "missing",
+            updated: container !== undefined && container.ImageID !== upgrade.oldImageId,
+          };
+        }),
+        oldImage: images.some((image) => image.id === upgrade.oldImageId)
+          ? "still present (Container Manager may still be deleting it)"
+          : "removed by Container Manager",
+      };
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  return {
+    repository: upgrade.repository,
+    status: "updating",
+    updateId,
+    state,
+    note: "Container Manager is downloading the image or recreating the containers. Call get_project_update_result with this updateId in about a minute, and again until status is done.",
+  };
+}
+
+/** control_container update: standalone containers on a latest tag only. */
+export async function updateStandaloneContainer(ctx: ToolContext, name: string, waitSeconds: number) {
+  ctx.policy.assertSystemControl("control_container(update)");
+  const [projects, containers, images] = await Promise.all([
+    listProjects(ctx.client),
+    listAllContainers(ctx.client),
+    listImages(ctx.client),
+  ]);
+  const container = containers.find((candidate) => candidate.name === name);
+  if (!container) throw new Error(`No container named "${name}".`);
+  if (container.id.startsWith(hostname())) {
+    throw new Error("Refused: this container runs this MCP server. Update it from Container Manager.");
+  }
+  const owner = projects.find((project) => projectContainers(project, [container]).length > 0);
+  if (owner) {
+    throw new Error(
+      `Refused: "${name}" belongs to project "${owner.name}". Use control_project with action update, which stops the whole project first.`,
+    );
+  }
+  const [repository, tag] = splitReference(container.image);
+  if (tag !== "latest") {
+    throw new Error(
+      `Refused: "${name}" uses ${container.image}; Container Manager only updates the latest tag.`,
+    );
+  }
+  const inProjects = projects.filter((project) =>
+    projectContainers(project, containers).some(
+      (member) => member.image === container.image || member.ImageID === container.ImageID,
+    ),
+  );
+  if (inProjects.length > 0) {
+    throw new Error(
+      `Refused: ${container.image} is also used by project ${inProjects.map((project) => `"${project.name}"`).join(", ")}, and Container Manager would recreate those containers without stopping their project. Run control_project update on it instead; it also reports this container.`,
+    );
+  }
+  if (!needsUpdate(container, images)) {
+    return {
+      container: name,
+      status: "up_to_date",
+      note: "Container Manager reports no newer image for this container.",
+    };
+  }
+  const users = containers
+    .filter((candidate) => candidate.ImageID === container.ImageID)
+    .map((candidate) => candidate.name);
+  const updateId = await startUpgrade(ctx.client, repository, users, container.ImageID);
+  return waitForUpgrade(ctx.client, updateId, pendingUpgrades.get(updateId)!, waitSeconds);
 }
 
 async function waitForUpdate(
@@ -413,14 +577,16 @@ export const projectTools = [
     name: "get_project_update_result",
     title: "Check a project update",
     description:
-      "Continues an update started by control_project that returned status \"downloading\". Once the images are downloaded it recreates the containers and removes the previous images, then returns status done.",
+      "Continues an update started by control_project (status \"downloading\") or control_container (status \"updating\"), or a standaloneUpdates entry. Once the images are downloaded it recreates the containers and removes the previous images, then returns status done.",
     destructive: true,
     schema: z.object({
-      updateId: z.string().describe("The updateId returned by control_project"),
+      updateId: z.string().describe("The updateId returned by control_project or control_container"),
       waitSeconds: z.number().int().min(1).max(30).default(20),
     }),
     handler: async (ctx, args) => {
       ctx.policy.assertSystemControl("get_project_update_result");
+      const upgrade = pendingUpgrades.get(args.updateId);
+      if (upgrade) return waitForUpgrade(ctx.client, args.updateId, upgrade, args.waitSeconds);
       const update = pendingUpdates.get(args.updateId);
       if (!update) {
         throw new Error(
