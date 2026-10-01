@@ -129,6 +129,9 @@ safe ones and every dangerous capability is opt-in.
 **Layer 1 — the DSM account.** Create a dedicated non-administrator user in
 DSM and grant it only the shared folders it needs. Nothing this server does can
 exceed what that account is allowed to do. Never point it at an admin account.
+Sign in to DSM once with the new account and open File Station: DSM only
+creates a user's File Station profile on its first interactive login, and
+until then searches can fail for that account.
 
 **Layer 2 — the policy switches.** Independent of DSM permissions:
 

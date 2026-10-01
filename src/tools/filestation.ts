@@ -244,7 +244,7 @@ export const fileStationReadTools = [
     name: "search_files",
     title: "Search for files",
     description:
-      "Searches a folder tree by filename pattern, extension, size or modified time. This runs a real DSM indexed search, so it is far cheaper than listing folders recursively. Returns once the search finishes or the timeout elapses.",
+      "Searches a folder tree by filename pattern, extension, size or modified time with a File Station background search. DSM walks the folders on the NAS itself, so it is cheaper than listing them recursively through this server, but large trees can take a while. Returns once the search finishes or the timeout elapses, with partial results if it is still running.",
     readOnly: true,
     schema: z.object({
       path: z.string().describe("Folder to search under, e.g. /Documents"),
