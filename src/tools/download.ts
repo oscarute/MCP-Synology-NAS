@@ -174,6 +174,13 @@ export const downloadStationTools = [
     destructive: true,
     schema: z.object({
       taskIds: z.array(z.string()).min(1).max(50),
+      titles: z
+        .array(z.string())
+        .min(1)
+        .max(50)
+        .describe(
+          "Title of each task, in the same order as taskIds, exactly as list_download_tasks shows it. Shown to the user when they approve the call, and checked against DSM before acting.",
+        ),
       action: z.enum(["pause", "resume", "delete"]),
       keepDownloadedData: z
         .boolean()
@@ -183,6 +190,24 @@ export const downloadStationTools = [
     handler: async (ctx, args) => {
       const ids = args.taskIds.join(",");
 
+      // The titles are what the user sees when approving the call, so refuse
+      // to act unless they really name the tasks being changed.
+      if (args.titles.length !== args.taskIds.length) {
+        throw new Error("titles must list one title per task id, in the same order.");
+      }
+      const current = await ctx.client.request<{ tasks: DownloadTask[] }>(
+        "SYNO.DownloadStation.Task",
+        "getinfo",
+        { id: ids },
+      );
+      const titleById = new Map((current.tasks ?? []).map((task) => [task.id, task.title]));
+      const mismatched = args.taskIds.filter((id, index) => titleById.get(id) !== args.titles[index]);
+      if (mismatched.length > 0) {
+        throw new Error(
+          `Refused: the titles do not match DSM for ${mismatched.map((id) => `${id} (DSM: ${titleById.get(id) ?? "no such task"})`).join(", ")}. Call list_download_tasks and retry with the exact titles.`,
+        );
+      }
+
       if (args.action === "delete") {
         ctx.policy.assertDeletable("control_download_task(delete)");
         const result = await ctx.client.request(
@@ -190,7 +215,7 @@ export const downloadStationTools = [
           "delete",
           { id: ids, force_complete: args.keepDownloadedData },
         );
-        return { action: "delete", taskIds: args.taskIds, result };
+        return { action: "delete", taskIds: args.taskIds, titles: args.titles, result };
       }
 
       ctx.policy.assertWritable(`control_download_task(${args.action})`);
@@ -199,7 +224,7 @@ export const downloadStationTools = [
         args.action,
         { id: ids },
       );
-      return { action: args.action, taskIds: args.taskIds, result };
+      return { action: args.action, taskIds: args.taskIds, titles: args.titles, result };
     },
   }),
 
