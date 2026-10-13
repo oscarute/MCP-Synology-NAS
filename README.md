@@ -167,7 +167,8 @@ must send `Authorization: Bearer <token>`.
 ## Installation
 
 The steps below use only the DSM web interface (File Station and
-Container Manager), no command line.
+Container Manager), no command line. They work on x86-64 and ARM64 models;
+ARM64 is supported but has not been tested on real hardware.
 
 1. On this repository's GitHub page, click **Code → Download ZIP**.
 2. In File Station, create a folder named `mcp-synology` inside the `docker`
