@@ -3,10 +3,10 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
-# Install with the lockfile-independent path so the image builds from a clean
-# checkout, then compile TypeScript to dist/.
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# Install exactly the versions pinned in the lockfile, so every image built
+# from the same commit has the same dependencies.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY tsconfig.json ./
 COPY src ./src
@@ -30,7 +30,7 @@ RUN apk add --no-cache tini
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-COPY package.json ./
+COPY package.json LICENSE ./
 
 # Run unprivileged; the node image already ships a "node" user.
 USER node
