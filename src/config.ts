@@ -116,6 +116,15 @@ export function loadConfig(): AppConfig {
     );
   }
 
+  // Over HTTP the token is the only thing between the network and the NAS,
+  // so running without one has to be an explicit choice.
+  const mcpToken = str("SYNOLOGY_MCP_TOKEN");
+  if (transport === "http" && !mcpToken && !bool("SYNOLOGY_ALLOW_NO_AUTH", false)) {
+    throw new ConfigError(
+      "SYNOLOGY_MCP_TOKEN is required in HTTP mode. Set a long random token, or set SYNOLOGY_ALLOW_NO_AUTH=true to run without authentication (only behind another layer that authenticates clients).",
+    );
+  }
+
   const policy = new SecurityPolicy({
     readOnly: bool("SYNOLOGY_READONLY", true),
     allowDelete: bool("SYNOLOGY_ALLOW_DELETE", false),
@@ -141,7 +150,7 @@ export function loadConfig(): AppConfig {
     transport,
     port: int("PORT", 3000, 1),
     host: str("HOST") ?? "0.0.0.0",
-    mcpToken: str("SYNOLOGY_MCP_TOKEN"),
+    mcpToken,
     logLevel: str("LOG_LEVEL") ?? "info",
   };
 }
