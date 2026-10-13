@@ -153,8 +153,10 @@ Tools that can never succeed under the current policy are hidden from the tool
 list rather than advertised and then refused, so the model does not keep
 retrying them.
 
-**Layer 3 — the transport.** Set `SYNOLOGY_MCP_TOKEN` and every HTTP client
-must send `Authorization: Bearer <token>`.
+**Layer 3 — the transport.** In HTTP mode `SYNOLOGY_MCP_TOKEN` is required and
+every client must send `Authorization: Bearer <token>`; the server refuses to
+start without it. Only set `SYNOLOGY_ALLOW_NO_AUTH=true` if another layer in
+front of it authenticates clients.
 
 ### Suggested rollout
 
@@ -166,49 +168,34 @@ must send `Authorization: Bearer <token>`.
 
 ## Installation
 
-The steps below use only the DSM web interface (File Station and
-Container Manager), no command line. They work on x86-64 and ARM64 models;
-ARM64 is supported but has not been tested on real hardware.
+The image is published on Docker Hub as
+[`oscarute/mcp-synology-nas`](https://hub.docker.com/r/oscarute/mcp-synology-nas)
+for x86-64 and ARM64 models; ARM64 is supported but has not been tested on
+real hardware. The steps below use only the DSM web interface.
 
-1. On this repository's GitHub page, click **Code → Download ZIP**.
-2. In File Station, create a folder named `mcp-synology` inside the `docker`
-   shared folder, upload the ZIP into it and extract it there
-   (right-click → **Extract → Extract here**).
-3. Copy `MCP-Synology-NAS-main/compose.yaml` one level up, into
-   `mcp-synology/`. The result should look like this:
-
-   ```
-   docker/
-   └── mcp-synology/
-       ├── compose.yaml                  ← your copy, edited in step 4
-       └── MCP-Synology-NAS-main/
-           ├── Dockerfile
-           ├── compose.yaml
-           └── src/
-   ```
-
-   Keeping your copy outside the source folder means an update never
-   overwrites your settings.
-4. Edit `mcp-synology/compose.yaml` (for example with the Text Editor
-   package) as described in [Configuration](#configuration).
-5. In **Container Manager → Project → Create**, name the project
+1. In File Station, create a folder named `mcp-synology` inside the `docker`
+   shared folder.
+2. Download [`compose.yaml`](compose.yaml) from this repository, edit it as
+   described in [Configuration](#configuration) and upload it into
+   `docker/mcp-synology/`.
+3. In **Container Manager → Project → Create**, name the project
    `mcp-synology`, set the path to `/docker/mcp-synology` and choose to use
-   the existing `compose.yaml`. Container Manager builds the image and starts
+   the existing `compose.yaml`. Container Manager pulls the image and starts
    the container.
 
 ### Updating
 
-1. Download the ZIP again and replace the `MCP-Synology-NAS-main` folder with
-   the new one. Your `compose.yaml` in `mcp-synology/` stays untouched.
-2. In **Container Manager → Project**, stop the `mcp-synology` project.
-3. Under **Container**, delete `synology-mcp`; then under **Image**, delete
-   `mcp-server-synology:latest`. Because `compose.yaml` names the image,
-   Container Manager reuses an existing one instead of rebuilding it, so
-   without this step the old code keeps running.
-4. Back in **Project**, build `mcp-synology`. The build log should show
-   `npm install` and `npm run build`.
+Container Manager shows **Update available** next to the image when a new
+`latest` is published. Then, in **Project**, stop `mcp-synology`, choose
+**Action → Build** and start it again; it pulls the new image and recreates
+the container. Your `compose.yaml` is not touched.
 
 Connected Claude conversations reconnect on their own after the restart.
+
+### Building from source
+
+Download the repository (**Code → Download ZIP**), extract it next to your
+`compose.yaml` and replace the `image:` line with `build: ./MCP-Synology-NAS-main`.
 
 ## Configuration
 
@@ -341,3 +328,4 @@ and *DSM Login Web API* guides, plus runtime discovery via `SYNO.API.Info`.
 ## License
 
 [MIT](LICENSE). Originally created by [Mrquj](https://github.com/Mrquj/mcp-server-synology).
+This project is not affiliated with or endorsed by Synology Inc.

@@ -1,6 +1,6 @@
 # Self-contained deployment: every setting lives in this file, no .env needed.
 # Fill in the values marked REQUIRED, then create a Container Manager project
-# from it (or run: docker compose up -d --build).
+# from it (or run: docker compose up -d). The image is pulled from Docker Hub.
 #
 # Once filled in, this file holds credentials: keep it private (chmod 600) and
 # never publish or commit your filled-in copy.
@@ -10,13 +10,10 @@
 
 services:
   synology-mcp:
-    build:
-      # Folder holding the Dockerfile. The default matches the layout in the
-      # README: docker/mcp-synology/compose.yaml next to the extracted
-      # MCP-Synology-NAS-main/ folder. Use "." if this file sits next to
-      # the Dockerfile (e.g. in a git clone).
-      context: ./MCP-Synology-NAS-main
-    image: mcp-server-synology:latest
+    # Published for x86-64 and ARM64. Pin a version (e.g. :1.1) to update
+    # only when you choose. To build from source instead, replace this line
+    # with "build: ." in a checkout of the repository.
+    image: oscarute/mcp-synology-nas:latest
     container_name: synology-mcp
     restart: unless-stopped
     environment:
@@ -62,8 +59,8 @@ services:
       SYNOLOGY_MCP_TRANSPORT: "http"
       HOST: "0.0.0.0"
       PORT: "3000"
-      # Clients must send "Authorization: Bearer <token>".
-      # Generate one with: openssl rand -hex 32
+      # REQUIRED. Clients must send "Authorization: Bearer <token>"; the server
+      # refuses to start without one. Generate one with: openssl rand -hex 32
       SYNOLOGY_MCP_TOKEN: ""
 
       # --- Reliability --------------------------------------------------------

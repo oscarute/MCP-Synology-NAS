@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -12,7 +13,10 @@ import type { ToolContext, ToolDef } from "./tool.js";
 import { allTools, buildToolIndex } from "./tools/index.js";
 
 export const SERVER_NAME = "synology";
-export const SERVER_VERSION = "1.0.0";
+// package.json is the single source of the version; it sits next to dist/.
+export const SERVER_VERSION: string = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+).version;
 
 /**
  * A tool that can never succeed under the current policy is hidden rather than
